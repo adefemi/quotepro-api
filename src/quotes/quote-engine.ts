@@ -22,6 +22,12 @@ class OpenAiQuoteGenerationTimeoutError extends Error {
   }
 }
 
+export class AiQuoteGenerationError extends Error {
+  constructor(message = "AI quote generation failed.") {
+    super(message);
+  }
+}
+
 export type OpenAiFetch = (
   url: string,
   init: {
@@ -44,6 +50,13 @@ interface QuoteGenerationOptions {
   openAiBaseUrl?: string;
   requestTimeoutMs?: number;
   fetchFn?: OpenAiFetch;
+}
+
+interface QuoteGenerationInput {
+  prompt: string;
+  collectDeposit: boolean;
+  businessName?: string;
+  serviceLine?: string;
 }
 
 type OpenAiQuoteRequestOptions = Required<
@@ -107,6 +120,18 @@ const plumbingItems: Omit<QuoteLineItemDto, "id">[] = [
   { title: "Removal of old copper + disposal", quantityLabel: "1 job", unitAmount: 15000, totalAmount: 15000 },
 ];
 
+const softwareItems: Omit<QuoteLineItemDto, "id">[] = [
+  { title: "Requirements review and April work plan", quantityLabel: "1 sprint", unitAmount: 60000, totalAmount: 60000 },
+  { title: "Software feature development", quantityLabel: "1 month", unitAmount: 240000, totalAmount: 240000 },
+  { title: "Testing, fixes, and deployment support", quantityLabel: "1 cycle", unitAmount: 90000, totalAmount: 90000 },
+];
+
+const hvacItems: Omit<QuoteLineItemDto, "id">[] = [
+  { title: "AC diagnostic and service materials", quantityLabel: "1 lot", unitAmount: 45000, totalAmount: 45000 },
+  { title: "Technician labour", quantityLabel: "1 job", unitAmount: 65000, totalAmount: 65000 },
+  { title: "Transport and site logistics", quantityLabel: "1 visit", unitAmount: 15000, totalAmount: 15000 },
+];
+
 const genericItems: Omit<QuoteLineItemDto, "id">[] = [
   { title: "Materials and supplies", quantityLabel: "1 lot", unitAmount: 85000, totalAmount: 85000 },
   { title: "Skilled labour", quantityLabel: "3 days", unitAmount: 25000, totalAmount: 75000 },
@@ -115,10 +140,7 @@ const genericItems: Omit<QuoteLineItemDto, "id">[] = [
 ];
 
 export async function generateQuoteFromPrompt(
-  input: {
-    prompt: string;
-    collectDeposit: boolean;
-  },
+  input: QuoteGenerationInput,
   options: QuoteGenerationOptions = {},
 ): Promise<GeneratedQuote> {
   const openAiApiKey = options.openAiApiKey ?? env.OPENAI_API_KEY;
@@ -130,48 +152,54 @@ export async function generateQuoteFromPrompt(
 
   const openAiModel = options.openAiModel ?? env.OPENAI_QUOTE_MODEL;
   const fallbackModel = options.openAiFallbackModel ?? env.OPENAI_QUOTE_FALLBACK_MODEL;
+  const models = [...new Set([openAiModel, fallbackModel].filter(Boolean))];
+  const errors: string[] = [];
 
-  try {
-    return await generateQuoteWithOpenAi(input, {
-      openAiApiKey,
-      openAiModel,
-      openAiBaseUrl: options.openAiBaseUrl ?? env.OPENAI_BASE_URL,
-      requestTimeoutMs: options.requestTimeoutMs ?? env.OPENAI_REQUEST_TIMEOUT_MS,
-      fetchFn,
-    });
-  } catch (error) {
-    if (error instanceof OpenAiQuoteGenerationTimeoutError) {
-      return generateDeterministicQuoteFromPrompt(input);
+  for (const model of models) {
+    try {
+      return await generateQuoteWithOpenAi(input, {
+        openAiApiKey,
+        openAiModel: model,
+        openAiBaseUrl: options.openAiBaseUrl ?? env.OPENAI_BASE_URL,
+        requestTimeoutMs: options.requestTimeoutMs ?? env.OPENAI_REQUEST_TIMEOUT_MS,
+        fetchFn,
+      });
+    } catch (error) {
+      errors.push(`${model}: ${error instanceof Error ? error.message : "Unknown AI error"}`);
     }
-
-    if (fallbackModel !== openAiModel) {
-      try {
-        return await generateQuoteWithOpenAi(input, {
-          openAiApiKey,
-          openAiModel: fallbackModel,
-          openAiBaseUrl: options.openAiBaseUrl ?? env.OPENAI_BASE_URL,
-          requestTimeoutMs: options.requestTimeoutMs ?? env.OPENAI_REQUEST_TIMEOUT_MS,
-          fetchFn,
-        });
-      } catch {
-        return generateDeterministicQuoteFromPrompt(input);
-      }
-    }
-
-    return generateDeterministicQuoteFromPrompt(input);
   }
+
+  throw new AiQuoteGenerationError(`AI quote generation failed. ${errors.join(" | ")}`);
 }
 
-export function generateDeterministicQuoteFromPrompt(input: {
-  prompt: string;
-  collectDeposit: boolean;
-}): GeneratedQuote {
-  const normalized = input.prompt.toLowerCase();
+export function generateDeterministicQuoteFromPrompt(input: QuoteGenerationInput): GeneratedQuote {
+  const normalized = `${input.prompt} ${input.serviceLine ?? ""}`.toLowerCase();
   const isPlumbing = ["bathroom", "pipe", "ppr", "plumb", "copper"].some((keyword) =>
     normalized.includes(keyword),
   );
-  const baseItems = isPlumbing ? plumbingItems : genericItems;
-  const jobTitle = isPlumbing ? "Full bathroom re-piping" : "Custom service job";
+  const isSoftware = [
+    "software",
+    "engineering",
+    "developer",
+    "development",
+    "website",
+    "web app",
+    "mobile app",
+    "backend",
+    "frontend",
+    "api",
+  ].some((keyword) => normalized.includes(keyword));
+  const isHvac = ["ac", "a/c", "hvac", "air condition", "air-condition", "cooling"].some((keyword) =>
+    normalized.includes(keyword),
+  );
+  const baseItems = isPlumbing ? plumbingItems : isSoftware ? softwareItems : isHvac ? hvacItems : genericItems;
+  const jobTitle = isPlumbing
+    ? "Full bathroom re-piping"
+    : isSoftware
+      ? "April software engineering tasks"
+      : isHvac
+        ? "AC / HVAC service job"
+        : "Custom service job";
   const subtotalAmount = baseItems.reduce((sum, item) => sum + item.totalAmount, 0);
   const vatAmount = Math.round(subtotalAmount * vatRate);
   const totalAmount = subtotalAmount + vatAmount;
@@ -192,7 +220,7 @@ export function generateDeterministicQuoteFromPrompt(input: {
 }
 
 async function generateQuoteWithOpenAi(
-  input: { prompt: string; collectDeposit: boolean },
+  input: QuoteGenerationInput,
   options: OpenAiQuoteRequestOptions,
 ): Promise<GeneratedQuote> {
   const controller = new AbortController();
@@ -213,11 +241,17 @@ async function generateQuoteWithOpenAi(
             {
               role: "system",
               content:
-                "You create practical Nigerian small-business service quotes. Return realistic whole NGN amounts only. Do not include VAT, deposit, discounts, markdown, or explanations.",
+                "You create practical Nigerian small-business service quotes. Prioritize the customer's explicit request over business context if they conflict. Return realistic whole NGN amounts only. Do not include VAT, deposit, discounts, markdown, or explanations.",
             },
             {
               role: "user",
-              content: `Create a quote draft for this customer request: ${input.prompt}`,
+              content: [
+                input.businessName ? `Business name: ${input.businessName}` : null,
+                input.serviceLine ? `Business offering: ${input.serviceLine}` : null,
+                `Customer request: ${input.prompt}`,
+              ]
+                .filter(Boolean)
+                .join("\n"),
             },
           ],
           max_output_tokens: 1200,
@@ -252,7 +286,7 @@ async function generateQuoteWithOpenAi(
   }
 }
 
-function completeQuote(input: { prompt: string; collectDeposit: boolean }, quote: z.infer<typeof aiQuoteSchema>) {
+function completeQuote(input: QuoteGenerationInput, quote: z.infer<typeof aiQuoteSchema>) {
   const items = quote.items.map((item, index) => ({
     id: `item-${String(index + 1).padStart(2, "0")}`,
     title: item.title,

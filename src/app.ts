@@ -11,31 +11,43 @@ import {
   initializePaymentSchema,
   otpStartSchema,
   otpVerifySchema,
+  payoutAccountResolveSchema,
   pinLoginSchema,
   pinSchema,
   payoutSchema,
   providerProfileSchema,
+  pushTokenDeleteSchema,
+  pushTokenUpsertSchema,
   sendQuoteSchema,
   signInSchema,
   updateQuoteSchema,
+  type NotificationPushPayload,
 } from "./domain.js";
 import {
   applyPaymentTransition,
+  archiveQuote,
   createCompany,
   createInitializedPayment,
   createPayoutAccount,
   createQuote,
   createSession,
+  deletePushDevice,
+  deleteQuote,
   getDashboard,
   getEarnings,
   getCompanyById,
+  getOrCreateQuoteEditDraft,
   loginWithPin,
   listCompanies,
   listPayoutAccounts,
+  listProviderNotifications,
+  markProviderNotificationRead,
   getProviderByToken,
   getProviderQuote,
   getProviderQuoteDetail,
+  getPublicPaymentByReference,
   getPublicQuoteBundle,
+  listQuotePage,
   listQuotes,
   recordPublicAccept,
   recordPublicView,
@@ -48,9 +60,20 @@ import {
   updateCompanyLogo,
   updateProviderProfile,
   updateQuote,
+  upsertPushDevice,
   verifyPhoneOtp,
 } from "./repository.js";
-import { initializePayment, mapPaystackWebhookEvent, verifyPaystackSignature } from "./payments/paystack.js";
+import {
+  createPaystackTransferRecipient,
+  initializePayment,
+  listPaystackBanks,
+  mapPaystackWebhookEvent,
+  resolvePaystackBankAccount,
+  verifyPaystackSignature,
+  verifyPaystackTransaction,
+} from "./payments/paystack.js";
+import { dispatchQuotePush } from "./notifications/dispatch.js";
+import { AiQuoteGenerationError } from "./quotes/quote-engine.js";
 import {
   type CompanyLogoFile,
   LogoUploadConfigError,
@@ -60,6 +83,27 @@ import {
 
 type RawBodyRequest = FastifyRequest & { rawBody?: string };
 type LogoUploader = (input: { providerId: string; companyId: string; file: CompanyLogoFile }) => Promise<string>;
+type QuotePushDispatch = (db: Database, payload: NotificationPushPayload) => Promise<void>;
+
+async function verifyPayoutAccount(input: { bankName: string; bankCode: string; accountNumber: string }) {
+  const resolved = await resolvePaystackBankAccount({
+    accountNumber: input.accountNumber,
+    bankCode: input.bankCode,
+  });
+  const recipient = await createPaystackTransferRecipient({
+    accountNumber: resolved.accountNumber,
+    bankCode: input.bankCode,
+    accountName: resolved.accountName,
+  });
+
+  return {
+    bankName: input.bankName,
+    bankCode: input.bankCode,
+    accountLast4: resolved.accountNumber.slice(-4),
+    accountName: resolved.accountName,
+    paystackRecipientCode: recipient.recipientCode,
+  };
+}
 
 function getBearerToken(request: FastifyRequest) {
   const header = request.headers.authorization;
@@ -71,11 +115,27 @@ function getBearerToken(request: FastifyRequest) {
   return header.slice("Bearer ".length).trim();
 }
 
-export function buildApp(db: Database, options: { logoUploader?: LogoUploader } = {}) {
+export function buildApp(
+  db: Database,
+  options: { logoUploader?: LogoUploader; pushDispatch?: QuotePushDispatch } = {},
+) {
   const app = Fastify({
     logger: true,
   });
   const logoUploader = options.logoUploader ?? uploadCompanyLogoToS3;
+  const runQuotePush = options.pushDispatch ?? dispatchQuotePush;
+
+  async function maybeDispatchPush(payload: NotificationPushPayload | undefined) {
+    if (!payload) {
+      return;
+    }
+
+    try {
+      await runQuotePush(db, payload);
+    } catch (error) {
+      app.log.error(error);
+    }
+  }
 
   app.removeContentTypeParser("application/json");
   app.addContentTypeParser("application/json", { parseAs: "string" }, (request, body, done) => {
@@ -207,7 +267,64 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
     }
 
     const body = payoutSchema.parse(request.body);
-    return savePayoutAccount(db, provider.id, body);
+    const payoutAccount = await verifyPayoutAccount(body);
+    return savePayoutAccount(db, provider.id, payoutAccount);
+  });
+
+  app.put("/providers/me/push-token", async (request, reply) => {
+    const provider = await requireAccount(request);
+
+    if (!provider) {
+      return reply.code(403).send({ message: "Account required." });
+    }
+
+    const body = pushTokenUpsertSchema.parse(request.body);
+    await upsertPushDevice(db, provider.id, body);
+    return { ok: true };
+  });
+
+  app.delete("/providers/me/push-token", async (request, reply) => {
+    const provider = await requireAccount(request);
+
+    if (!provider) {
+      return reply.code(403).send({ message: "Account required." });
+    }
+
+    const body = pushTokenDeleteSchema.parse(request.body);
+    await deletePushDevice(db, provider.id, body.token);
+    return { ok: true };
+  });
+
+  app.get("/providers/me/notifications", async (request, reply) => {
+    const provider = await requireProvider(request);
+
+    if (!provider) {
+      return reply.code(401).send({ message: "Unauthorized." });
+    }
+
+    const rawLimit = (request.query as { limit?: string }).limit;
+    const parsed = rawLimit ? Number(rawLimit) : 50;
+    const limit = Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), 100) : 50;
+
+    const notifications = await listProviderNotifications(db, provider.id, { limit });
+    return { notifications };
+  });
+
+  app.post("/providers/me/notifications/:notificationId/read", async (request, reply) => {
+    const provider = await requireProvider(request);
+
+    if (!provider) {
+      return reply.code(401).send({ message: "Unauthorized." });
+    }
+
+    const notificationId = (request.params as { notificationId: string }).notificationId;
+    const ok = await markProviderNotificationRead(db, provider.id, notificationId);
+
+    if (!ok) {
+      return reply.code(404).send({ message: "Not found." });
+    }
+
+    return { ok: true };
   });
 
   app.get("/companies", async (request, reply) => {
@@ -299,6 +416,27 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
     }
   });
 
+  app.get("/payout-banks", async (request, reply) => {
+    const provider = await requireAccount(request);
+
+    if (!provider) {
+      return reply.code(403).send({ message: "Account required." });
+    }
+
+    return { banks: await listPaystackBanks() };
+  });
+
+  app.post("/payout-accounts/resolve", async (request, reply) => {
+    const provider = await requireAccount(request);
+
+    if (!provider) {
+      return reply.code(403).send({ message: "Account required." });
+    }
+
+    const body = payoutAccountResolveSchema.parse(request.body);
+    return resolvePaystackBankAccount(body);
+  });
+
   app.get("/payout-accounts", async (request, reply) => {
     const provider = await requireAccount(request);
 
@@ -317,7 +455,8 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
     }
 
     const body = payoutSchema.parse(request.body);
-    return reply.code(201).send(await createPayoutAccount(db, provider.id, body));
+    const payoutAccount = await verifyPayoutAccount(body);
+    return reply.code(201).send(await createPayoutAccount(db, provider.id, payoutAccount));
   });
 
   app.post("/payout-accounts/:payoutAccountId/default", async (request, reply) => {
@@ -344,6 +483,29 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
       return reply.code(401).send({ message: "Unauthorized." });
     }
 
+    const query = request.query as {
+      filter?: string;
+      limit?: string;
+      offset?: string;
+      search?: string;
+      serviceLine?: string;
+    };
+    const filter = ["all", "unpaid", "viewed", "drafts"].includes(query.filter ?? "")
+      ? (query.filter as "all" | "unpaid" | "viewed" | "drafts")
+      : "all";
+    const limit = Math.min(Math.max(Number(query.limit) || 50, 1), 100);
+    const offset = Math.max(Number(query.offset) || 0, 0);
+
+    if (query.filter || query.limit || query.offset) {
+      return listQuotePage(db, provider.id, {
+        filter,
+        limit,
+        offset,
+        search: query.search,
+        serviceLine: query.serviceLine,
+      });
+    }
+
     return { quotes: await listQuotes(db, provider.id) };
   });
 
@@ -355,7 +517,19 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
     }
 
     const body = createQuoteSchema.parse(request.body);
-    const quote = await createQuote(db, provider.id, body);
+    const quote = await createQuote(db, provider.id, body).catch((error: unknown) => {
+      if (error instanceof AiQuoteGenerationError) {
+        return error;
+      }
+      throw error;
+    });
+
+    if (quote instanceof AiQuoteGenerationError) {
+      request.log.error({ err: quote }, "AI quote generation failed");
+      return reply.code(503).send({
+        message: "AI quote generation failed. Please try again.",
+      });
+    }
 
     if (!quote) {
       return reply.code(400).send({ message: "Invalid company." });
@@ -407,13 +581,76 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
 
     const quoteId = (request.params as { quoteId: string }).quoteId;
     const body = updateQuoteSchema.parse(request.body);
-    const quote = await updateQuote(db, provider.id, quoteId, body);
+    const quote = await updateQuote(db, provider.id, quoteId, body).catch((error: unknown) => {
+      if (error instanceof AiQuoteGenerationError) {
+        return error;
+      }
+      throw error;
+    });
+
+    if (quote instanceof AiQuoteGenerationError) {
+      request.log.error({ err: quote }, "AI quote generation failed");
+      return reply.code(503).send({
+        message: "AI quote generation failed. Please try again.",
+      });
+    }
 
     if (!quote) {
       return reply.code(404).send({ message: "Quote not found." });
     }
 
     return quote;
+  });
+
+  app.post("/quotes/:quoteId/archive", async (request, reply) => {
+    const provider = await requireProvider(request);
+
+    if (!provider) {
+      return reply.code(401).send({ message: "Unauthorized." });
+    }
+
+    const quoteId = (request.params as { quoteId: string }).quoteId;
+    const quote = await archiveQuote(db, provider.id, quoteId);
+
+    if (!quote) {
+      return reply.code(404).send({ message: "Quote not found." });
+    }
+
+    return quote;
+  });
+
+  app.post("/quotes/:quoteId/edit-draft", async (request, reply) => {
+    const provider = await requireProvider(request);
+
+    if (!provider) {
+      return reply.code(401).send({ message: "Unauthorized." });
+    }
+
+    const quoteId = (request.params as { quoteId: string }).quoteId;
+    const quote = await getOrCreateQuoteEditDraft(db, provider.id, quoteId);
+
+    if (!quote) {
+      return reply.code(404).send({ message: "Quote not found." });
+    }
+
+    return quote;
+  });
+
+  app.delete("/quotes/:quoteId", async (request, reply) => {
+    const provider = await requireProvider(request);
+
+    if (!provider) {
+      return reply.code(401).send({ message: "Unauthorized." });
+    }
+
+    const quoteId = (request.params as { quoteId: string }).quoteId;
+    const deleted = await deleteQuote(db, provider.id, quoteId);
+
+    if (!deleted) {
+      return reply.code(404).send({ message: "Quote not found." });
+    }
+
+    return reply.code(204).send();
   });
 
   app.post("/quotes/:quoteId/send", async (request, reply) => {
@@ -467,24 +704,26 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
 
   app.post("/public/quotes/:quoteId/view", async (request, reply) => {
     const quoteId = (request.params as { quoteId: string }).quoteId;
-    const bundle = await recordPublicView(db, quoteId);
+    const result = await recordPublicView(db, quoteId);
 
-    if (!bundle) {
+    if (!result) {
       return reply.code(404).send({ message: "Quote not found." });
     }
 
-    return bundle;
+    await maybeDispatchPush(result.pushTarget);
+    return result.bundle;
   });
 
   app.post("/public/quotes/:quoteId/accept", async (request, reply) => {
     const quoteId = (request.params as { quoteId: string }).quoteId;
-    const bundle = await recordPublicAccept(db, quoteId);
+    const result = await recordPublicAccept(db, quoteId);
 
-    if (!bundle) {
+    if (!result) {
       return reply.code(404).send({ message: "Quote not found." });
     }
 
-    return bundle;
+    await maybeDispatchPush(result.pushTarget);
+    return result.bundle;
   });
 
   app.post("/payments/initialize", async (request, reply) => {
@@ -495,10 +734,21 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
       return reply.code(404).send({ message: "Quote not found." });
     }
 
+    if (!bundle.quote.collectDeposit || bundle.quote.depositAmount <= 0) {
+      return reply.code(400).send({ message: "This quote does not require a deposit payment." });
+    }
+
+    if (["partial", "paid", "expired"].includes(bundle.quote.status)) {
+      return reply.code(409).send({ message: "This quote is no longer accepting deposit payments." });
+    }
+
+    const amount = bundle.quote.depositAmount;
+    const quoteId = bundle.quote.id;
+
     const result = await initializePayment({
       email: body.email,
-      amount: body.amount,
-      quoteId: body.quoteId ?? bundle.quote.id,
+      amount,
+      quoteId,
       publicSlug: body.publicSlug,
       channel: body.channel,
       callbackUrl: `${env.APP_PUBLIC_URL}/q/${bundle.quote.publicSlug}/receipt`,
@@ -508,11 +758,76 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
       publicSlug: body.publicSlug,
       email: body.email,
       channel: body.channel,
-      amount: body.amount,
+      amount,
       reference: result.reference,
     });
 
+    if (result.mode === "mock") {
+      const transitionResult = await applyPaymentTransition(db, {
+        reference: result.reference,
+        status: "paid",
+        eventLabel: "Mock deposit paid",
+        rawPayload: { event: "mock.charge.success", data: { reference: result.reference } },
+      });
+
+      await maybeDispatchPush(transitionResult?.pushTarget);
+    }
+
     return result;
+  });
+
+  app.get("/payments/:reference/status", async (request, reply) => {
+    const reference = (request.params as { reference: string }).reference;
+    const publicSlug = (request.query as { publicSlug?: string }).publicSlug;
+
+    if (!publicSlug) {
+      return reply.code(400).send({ message: "publicSlug is required." });
+    }
+
+    const payment = await getPublicPaymentByReference(db, { publicSlug, reference });
+
+    if (!payment) {
+      return reply.code(404).send({ message: "Payment not found." });
+    }
+
+    return payment;
+  });
+
+  app.post("/payments/:reference/verify", async (request, reply) => {
+    const reference = (request.params as { reference: string }).reference;
+    const publicSlug = (request.body as { publicSlug?: string }).publicSlug;
+
+    if (!publicSlug) {
+      return reply.code(400).send({ message: "publicSlug is required." });
+    }
+
+    const existingPayment = await getPublicPaymentByReference(db, { publicSlug, reference });
+
+    if (!existingPayment) {
+      return reply.code(404).send({ message: "Payment not found." });
+    }
+
+    if (existingPayment.status === "paid") {
+      return existingPayment;
+    }
+
+    const verification = await verifyPaystackTransaction(reference);
+    const transitionResult = await applyPaymentTransition(db, {
+      reference,
+      status: verification.paymentStatus,
+      eventLabel: verification.eventLabel,
+      rawPayload: verification.rawPayload,
+    });
+
+    await maybeDispatchPush(transitionResult?.pushTarget);
+
+    const payment = await getPublicPaymentByReference(db, { publicSlug, reference });
+
+    if (!payment) {
+      return reply.code(404).send({ message: "Payment not found." });
+    }
+
+    return payment;
   });
 
   app.post("/payments/paystack/webhook", async (request, reply) => {
@@ -533,12 +848,14 @@ export function buildApp(db: Database, options: { logoUploader?: LogoUploader } 
     const transition = mapPaystackWebhookEvent(payload.event ?? "");
 
     if (transition.quoteEvent !== "ignored" && payload.data?.reference) {
-      await applyPaymentTransition(db, {
+      const transitionResult = await applyPaymentTransition(db, {
         reference: payload.data.reference,
         status: transition.paymentStatus,
         eventLabel: transition.label,
         rawPayload: payload,
       });
+
+      await maybeDispatchPush(transitionResult?.pushTarget);
     }
 
     return {

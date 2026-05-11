@@ -11,6 +11,9 @@ coverage/
 .env.local
 .env.*.local
 
+# Firebase Admin service account (use firebase.json locally; never commit)
+firebase.json
+
 # Tooling and OS files
 .DS_Store
 .idea/

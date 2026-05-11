@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const quoteStatuses = ["draft", "sent", "viewed", "accepted", "partial", "paid", "expired"] as const;
+export const quoteStatuses = ["draft", "sent", "viewed", "accepted", "partial", "paid", "expired", "archived"] as const;
 export const paymentStatuses = ["pending", "initialized", "paid", "failed"] as const;
 
 export type QuoteStatus = (typeof quoteStatuses)[number];
@@ -34,9 +34,15 @@ export interface PayoutAccountDto {
   id: string;
   providerId: string;
   bankName: string;
+  bankCode?: string;
   accountLast4: string;
   accountName?: string;
   isDefault: boolean;
+}
+
+export interface PayoutBankDto {
+  name: string;
+  code: string;
 }
 
 export interface QuoteLineItemDto {
@@ -81,6 +87,14 @@ export interface QuoteBundleDto {
   timeline: QuoteEventDto[];
 }
 
+export interface PaymentRecordDto {
+  id: string;
+  quoteId: string;
+  amount: number;
+  reference: string;
+  status: PaymentStatus;
+}
+
 export const signInSchema = z.object({
   channel: z.enum(["google", "phone", "demo"]).default("demo"),
 });
@@ -118,8 +132,13 @@ export const companyProfileSchema = z.object({
 
 export const payoutSchema = z.object({
   bankName: z.string().trim().min(1),
-  accountLast4: z.string().trim().min(4).max(4),
-  accountName: z.string().trim().optional(),
+  bankCode: z.string().trim().min(1),
+  accountNumber: z.string().trim().regex(/^\d{10}$/),
+});
+
+export const payoutAccountResolveSchema = z.object({
+  bankCode: z.string().trim().min(1),
+  accountNumber: z.string().trim().regex(/^\d{10}$/),
 });
 
 export const createQuoteSchema = z.object({
@@ -129,11 +148,39 @@ export const createQuoteSchema = z.object({
   customerLocation: z.string().trim().min(1),
   prompt: z.string().trim().min(1),
   collectDeposit: z.boolean().optional().default(true),
+  jobTitle: z.string().trim().min(1).optional(),
+  description: z.string().trim().min(1).optional(),
+  items: z
+    .array(
+      z.object({
+        title: z.string().trim().min(1),
+        quantityLabel: z.string().trim().min(1),
+        unitAmount: z.number().int().nonnegative(),
+        totalAmount: z.number().int().nonnegative(),
+      }),
+    )
+    .optional(),
 });
 
 export const updateQuoteSchema = z.object({
   collectDeposit: z.boolean().optional(),
   status: z.enum(quoteStatuses).optional(),
+  customerName: z.string().trim().min(1).optional(),
+  customerPhone: z.string().trim().optional(),
+  customerLocation: z.string().trim().min(1).optional(),
+  prompt: z.string().trim().min(1).optional(),
+  jobTitle: z.string().trim().min(1).optional(),
+  description: z.string().trim().min(1).optional(),
+  items: z
+    .array(
+      z.object({
+        title: z.string().trim().min(1),
+        quantityLabel: z.string().trim().min(1),
+        unitAmount: z.number().int().nonnegative(),
+        totalAmount: z.number().int().nonnegative(),
+      }),
+    )
+    .optional(),
 });
 
 export const sendQuoteSchema = z.object({
@@ -144,7 +191,42 @@ export const sendQuoteSchema = z.object({
 export const initializePaymentSchema = z.object({
   email: z.string().email(),
   channel: z.enum(["card", "bank_transfer", "ussd"]).default("card"),
-  amount: z.number().int().positive(),
-  quoteId: z.string().min(1).optional(),
   publicSlug: z.string().min(1),
 });
+
+export const pushTokenUpsertSchema = z.object({
+  token: z.string().trim().min(1),
+  platform: z.enum(["ios", "android"]),
+  appVersion: z.string().trim().optional(),
+  deviceId: z.string().trim().optional(),
+});
+
+export const pushTokenDeleteSchema = z.object({
+  token: z.string().trim().min(1),
+});
+
+export interface ProviderNotificationDto {
+  id: string;
+  quoteId: string | null;
+  kind: string;
+  title: string;
+  body: string;
+  readAt: string | null;
+  createdAt: string;
+}
+
+export type NotificationPushKind = "viewed" | "accepted" | "deposit_paid" | "payment_failed";
+
+export interface NotificationPushPayload {
+  providerId: string;
+  notificationId: string;
+  quoteId: string;
+  kind: NotificationPushKind;
+  title: string;
+  body: string;
+}
+
+export interface QuotePublicActionResult {
+  bundle: QuoteBundleDto;
+  pushTarget: NotificationPushPayload;
+}

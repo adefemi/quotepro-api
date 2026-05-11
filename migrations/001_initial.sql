@@ -43,6 +43,7 @@ create table if not exists quotes (
   id uuid primary key default gen_random_uuid(),
   quote_number text not null unique,
   public_slug text not null unique,
+  source_quote_id uuid references quotes(id) on delete set null,
   provider_id uuid not null references providers(id) on delete cascade,
   customer_id uuid references customers(id) on delete set null,
   customer_name text not null,
@@ -64,7 +65,7 @@ create table if not exists quotes (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint quotes_status_check check (
-    status in ('draft', 'sent', 'viewed', 'accepted', 'partial', 'paid', 'expired')
+    status in ('draft', 'sent', 'viewed', 'accepted', 'partial', 'paid', 'expired', 'archived')
   )
 );
 

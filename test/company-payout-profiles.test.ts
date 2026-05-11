@@ -3,14 +3,19 @@ import { describe, expect, it } from "vitest";
 import type { Database } from "../src/db/pool.js";
 import {
   applyPaymentTransition,
+  archiveQuote,
   createCompany,
   createInitializedPayment,
   createPayoutAccount,
   createQuote,
+  deleteQuote,
   getDashboard,
   getEarnings,
+  getOrCreateQuoteEditDraft,
   getPublicQuoteBundle,
   listCompanies,
+  listQuotePage,
+  listQuotes,
   recordPublicAccept,
   recordPublicView,
   recordQuoteSend,
@@ -34,8 +39,10 @@ type PayoutRow = {
   id: string;
   provider_id: string;
   bank_name: string;
+  bank_code: string | null;
   account_number_last4: string;
   account_name: string | null;
+  paystack_recipient_code: string | null;
   is_default: boolean;
   created_at: Date;
 };
@@ -44,6 +51,7 @@ type QuoteRow = {
   id: string;
   quote_number: string;
   public_slug: string;
+  source_quote_id: string | null;
   provider_id: string;
   customer_id: string;
   customer_name: string;
@@ -180,9 +188,11 @@ class FakeDb {
       const account = this.createPayout({
         provider_id: params[0] as string,
         bank_name: params[1] as string,
-        account_number_last4: params[2] as string,
-        account_name: (params[3] as string | null) ?? null,
-        is_default: params[4] as boolean,
+        bank_code: (params[2] as string | null) ?? null,
+        account_number_last4: params[3] as string,
+        account_name: (params[4] as string | null) ?? null,
+        paystack_recipient_code: (params[5] as string | null) ?? null,
+        is_default: params[6] as boolean,
       });
       return { rows: [account] };
     }
@@ -204,25 +214,50 @@ class FakeDb {
     }
 
     if (normalized.startsWith("insert into quotes")) {
-      const quote = this.createQuote({
-        quote_number: params[0] as string,
-        public_slug: params[1] as string,
-        provider_id: params[2] as string,
-        customer_id: params[3] as string,
-        customer_name: params[4] as string,
-        customer_phone: params[5] as string,
-        customer_location: params[6] as string,
-        job_title: params[7] as string,
-        description: params[8] as string,
-        prompt: params[9] as string,
-        subtotal_amount: params[10] as number,
-        vat_amount: params[11] as number,
-        total_amount: params[12] as number,
-        deposit_amount: params[13] as number,
-        collect_deposit: params[14] as boolean,
-        valid_until: params[15] as Date,
-        company_id: params[16] as string,
-      });
+      const hasSource = normalized.includes("source_quote_id");
+      const quote = this.createQuote(
+        hasSource
+          ? {
+              quote_number: params[0] as string,
+              public_slug: params[1] as string,
+              source_quote_id: params[2] as string,
+              provider_id: params[3] as string,
+              customer_id: params[4] as string,
+              customer_name: params[5] as string,
+              customer_phone: params[6] as string,
+              customer_location: params[7] as string,
+              job_title: params[8] as string,
+              description: params[9] as string,
+              prompt: params[10] as string,
+              subtotal_amount: params[11] as number,
+              vat_amount: params[12] as number,
+              total_amount: params[13] as number,
+              deposit_amount: params[14] as number,
+              collect_deposit: params[15] as boolean,
+              valid_until: params[16] as Date,
+              company_id: params[17] as string,
+            }
+          : {
+              quote_number: params[0] as string,
+              public_slug: params[1] as string,
+              source_quote_id: null,
+              provider_id: params[2] as string,
+              customer_id: params[3] as string,
+              customer_name: params[4] as string,
+              customer_phone: params[5] as string,
+              customer_location: params[6] as string,
+              job_title: params[7] as string,
+              description: params[8] as string,
+              prompt: params[9] as string,
+              subtotal_amount: params[10] as number,
+              vat_amount: params[11] as number,
+              total_amount: params[12] as number,
+              deposit_amount: params[13] as number,
+              collect_deposit: params[14] as boolean,
+              valid_until: params[15] as Date,
+              company_id: params[16] as string,
+            },
+      );
       return { rows: [quote] };
     }
 
@@ -239,8 +274,28 @@ class FakeDb {
       return { rows: [] };
     }
 
+    if (normalized.startsWith("delete from quote_items where quote_id")) {
+      const quoteId = params[0] as string;
+      this.quoteItems = this.quoteItems.filter((item) => item.quote_id !== quoteId);
+      return { rows: [] };
+    }
+
     if (normalized.startsWith("insert into send_attempts")) {
       return { rows: [] };
+    }
+
+    if (normalized.includes("select provider_id::text, customer_name, quote_number from quotes where id")) {
+      const quote = this.quotes.get(params[0] as string);
+      if (!quote) return { rows: [] };
+      return {
+        rows: [
+          {
+            provider_id: quote.provider_id,
+            customer_name: quote.customer_name,
+            quote_number: quote.quote_number,
+          },
+        ],
+      };
     }
 
     if (normalized.startsWith("update quotes set status = case when status = 'draft' then 'sent'")) {
@@ -250,6 +305,45 @@ class FakeDb {
         quote.sent_at = quote.sent_at ?? new Date();
       }
       return { rows: [] };
+    }
+
+    if (normalized.startsWith("update quotes set status = 'archived'")) {
+      const quote = this.quotes.get(params[0] as string);
+      if (!quote) return { rows: [] };
+      quote.status = "archived";
+      return { rows: [quote] };
+    }
+
+    if (normalized.startsWith("update quotes set job_title")) {
+      const quote = this.quotes.get(params[0] as string);
+      if (!quote) return { rows: [] };
+      quote.job_title = params[1] as string;
+      quote.description = params[2] as string;
+      quote.subtotal_amount = params[3] as number;
+      quote.vat_amount = params[4] as number;
+      quote.total_amount = params[5] as number;
+      quote.collect_deposit = params[6] as boolean;
+      quote.deposit_amount = params[7] as number;
+      quote.status = params[8] as string;
+      return { rows: [quote] };
+    }
+
+    if (normalized.startsWith("update quotes set customer_name")) {
+      const quote = this.quotes.get(params[0] as string);
+      if (!quote) return { rows: [] };
+      quote.customer_name = params[1] as string;
+      quote.customer_phone = params[2] as string;
+      quote.customer_location = params[3] as string;
+      quote.job_title = params[4] as string;
+      quote.description = params[5] as string;
+      quote.prompt = params[6] as string;
+      quote.subtotal_amount = params[7] as number;
+      quote.vat_amount = params[8] as number;
+      quote.total_amount = params[9] as number;
+      quote.collect_deposit = params[10] as boolean;
+      quote.deposit_amount = params[11] as number;
+      quote.status = params[12] as string;
+      return { rows: [quote] };
     }
 
     if (normalized.startsWith("update quotes set status = case when status in ('draft', 'sent') then 'viewed'")) {
@@ -276,20 +370,13 @@ class FakeDb {
       return { rows: [] };
     }
 
+    if (normalized.startsWith("insert into provider_notifications")) {
+      return { rows: [{ id: `notif-${this.nextId++}` }] };
+    }
+
     if (normalized.startsWith("insert into quote_events")) {
-      const kind = normalized.includes("'sent'")
-        ? "sent"
-        : normalized.includes("'viewed'")
-          ? "viewed"
-          : normalized.includes("'accepted'")
-            ? "accepted"
-            : normalized.includes("'deposit_paid'")
-              ? "deposit_paid"
-              : normalized.includes("'payment_failed'")
-                ? "payment_failed"
-                : normalized.includes("'drafted'")
-                  ? "drafted"
-                  : (params[1] as string);
+      const knownKinds = ["sent", "viewed", "accepted", "deposit_paid", "payment_failed", "drafted", "archived"];
+      const kind = knownKinds.find((value) => normalized.includes(`'${value}'`)) ?? (params[1] as string);
       const label =
         kind === "sent" || kind === "deposit_paid" || kind === "payment_failed"
           ? (params[1] as string)
@@ -299,7 +386,9 @@ class FakeDb {
               ? "Customer accepted quote"
               : kind === "drafted"
                 ? "Quote drafted"
-                : (params[2] as string);
+                : kind === "archived"
+                  ? "Quote archived"
+                  : (params[2] as string);
       this.events.push({
         id: `event-${this.nextId++}`,
         quote_id: params[0] as string,
@@ -319,17 +408,82 @@ class FakeDb {
       };
     }
 
-    if (normalized.startsWith("select * from quotes where provider_id = $1")) {
+    if (normalized.startsWith("select distinct pc.service_line")) {
       const providerId = params[0] as string;
+      const serviceLines = new Set<string>();
+      for (const company of this.companies.values()) {
+        const hasQuote = [...this.quotes.values()].some(
+          (quote) =>
+            quote.provider_id === providerId &&
+            quote.company_id === company.id &&
+            quote.status !== "archived",
+        );
+        if (company.provider_id === providerId && company.service_line && hasQuote) {
+          serviceLines.add(company.service_line);
+        }
+      }
       return {
-        rows: [...this.quotes.values()]
-          .filter((quote) => quote.provider_id === providerId)
-          .sort((left, right) => right.valid_until.getTime() - left.valid_until.getTime()),
+        rows: [...serviceLines].sort().map((service_line) => ({ service_line })),
       };
     }
 
+    if (normalized.startsWith("select count(*)::int as total from quotes q")) {
+      const rows = this.filteredQuoteRows(normalized, params);
+      return { rows: [{ total: rows.length }] };
+    }
+
+    if (normalized.startsWith("select q.* from quotes q")) {
+      const limit = params.at(-2) as number;
+      const offset = params.at(-1) as number;
+      return {
+        rows: this.filteredQuoteRows(normalized, params)
+          .sort((left, right) => new Date(right.valid_until).getTime() - new Date(left.valid_until).getTime())
+          .slice(offset, offset + limit),
+      };
+    }
+
+    if (normalized.startsWith("select * from quotes where provider_id = $1")) {
+      if (normalized.includes("source_quote_id = $2")) {
+        const providerId = params[0] as string;
+        const sourceQuoteId = params[1] as string;
+        return {
+          rows: [...this.quotes.values()]
+            .filter(
+              (quote) =>
+                quote.provider_id === providerId &&
+                quote.source_quote_id === sourceQuoteId &&
+                quote.status === "draft",
+            )
+            .sort((left, right) => new Date(right.valid_until).getTime() - new Date(left.valid_until).getTime())
+            .slice(0, 1),
+        };
+      }
+      const providerId = params[0] as string;
+      return {
+        rows: [...this.quotes.values()]
+          .filter((quote) => quote.provider_id === providerId && quote.status !== "archived")
+          .sort((left, right) => new Date(right.valid_until).getTime() - new Date(left.valid_until).getTime()),
+      };
+    }
+
+    if (normalized.startsWith("select count(*)::int as total from quotes where provider_id = $1")) {
+      const providerId = params[0] as string;
+      const rows = [...this.quotes.values()].filter((quote) => {
+        if (quote.provider_id !== providerId || quote.status === "archived") return false;
+        if (normalized.includes("status = 'viewed'")) return quote.status === "viewed";
+        if (normalized.includes("status = 'draft'")) return quote.status === "draft";
+        if (normalized.includes("status in ('sent', 'viewed', 'accepted', 'partial', 'expired')")) {
+          return ["sent", "viewed", "accepted", "partial", "expired"].includes(quote.status);
+        }
+        return true;
+      });
+      return { rows: [{ total: rows.length }] };
+    }
+
     if (normalized.startsWith("select coalesce(sum(case when status in")) {
-      const quotes = [...this.quotes.values()].filter((quote) => quote.provider_id === params[0]);
+      const quotes = [...this.quotes.values()].filter(
+        (quote) => quote.provider_id === params[0] && quote.status !== "archived",
+      );
       return {
         rows: [
           {
@@ -348,7 +502,7 @@ class FakeDb {
       const providerId = params[0] as string;
       const paid = [...this.payments.values()].filter((payment) => {
         const quote = this.quotes.get(payment.quote_id);
-        return quote?.provider_id === providerId && payment.status === "paid";
+        return quote?.provider_id === providerId && quote.status !== "archived" && payment.status === "paid";
       });
       return {
         rows: [
@@ -364,7 +518,7 @@ class FakeDb {
       const providerId = params[0] as string;
       const totals = new Map<string, number>();
       for (const quote of this.quotes.values()) {
-        if (quote.provider_id !== providerId || !["partial", "paid"].includes(quote.status)) continue;
+        if (quote.provider_id !== providerId || quote.status === "archived" || !["partial", "paid"].includes(quote.status)) continue;
         totals.set(quote.customer_name, (totals.get(quote.customer_name) ?? 0) + quote.total_amount);
       }
       return {
@@ -394,6 +548,14 @@ class FakeDb {
       payment.raw_payload = params[2];
       if (payment.status === "paid") payment.paid_at = payment.paid_at ?? new Date();
       return { rows: [payment] };
+    }
+
+    if (normalized.startsWith("delete from quotes where id = $1")) {
+      const quoteId = params[0] as string;
+      this.quotes.delete(quoteId);
+      this.quoteItems = this.quoteItems.filter((item) => item.quote_id !== quoteId);
+      this.events = this.events.filter((event) => event.quote_id !== quoteId);
+      return { rows: [] };
     }
 
     if (normalized.startsWith("select * from quotes")) {
@@ -476,6 +638,40 @@ class FakeDb {
     this.quotes.set(quote.id, quote);
     return quote;
   }
+
+  private filteredQuoteRows(normalizedSql: string, params: unknown[]) {
+    const providerId = params[0] as string;
+    const search = normalizedSql.includes("lower(q.job_title)") ? (params[1] as string).replaceAll("%", "") : "";
+    const serviceLineParamIndex = normalizedSql.includes("pc.service_line")
+      ? search
+        ? 2
+        : 1
+      : -1;
+    const serviceLine = serviceLineParamIndex > -1 ? (params[serviceLineParamIndex] as string) : "";
+
+    return [...this.quotes.values()].filter((quote) => {
+      if (quote.provider_id !== providerId || quote.status === "archived") return false;
+      if (normalizedSql.includes("q.status = 'viewed'") && quote.status !== "viewed") return false;
+      if (normalizedSql.includes("q.status = 'draft'") && quote.status !== "draft") return false;
+      if (
+        normalizedSql.includes("q.status in ('sent', 'viewed', 'accepted', 'partial', 'expired')") &&
+        !["sent", "viewed", "accepted", "partial", "expired"].includes(quote.status)
+      ) {
+        return false;
+      }
+      if (
+        search &&
+        !`${quote.job_title} ${quote.customer_name} ${quote.description}`.toLowerCase().includes(search.toLowerCase())
+      ) {
+        return false;
+      }
+      if (serviceLine) {
+        const company = quote.company_id ? this.companies.get(quote.company_id) : null;
+        if (company?.service_line !== serviceLine) return false;
+      }
+      return true;
+    });
+  }
 }
 
 describe("company and payout profiles", () => {
@@ -513,6 +709,9 @@ describe("company and payout profiles", () => {
     const first = await createPayoutAccount(db, "provider-1", {
       bankName: "GTBank",
       accountLast4: "2018",
+      bankCode: "058",
+      accountName: "ADE FEMI",
+      paystackRecipientCode: "RCP_123",
     });
     const second = await createPayoutAccount(db, "provider-1", {
       bankName: "Access Bank",
@@ -520,6 +719,8 @@ describe("company and payout profiles", () => {
     });
 
     expect(first.isDefault).toBe(true);
+    expect(first.bankCode).toBe("058");
+    expect(first.accountName).toBe("ADE FEMI");
     expect(second.isDefault).toBe(false);
 
     const selected = await setDefaultPayoutAccount(db, "provider-1", second.id);
@@ -573,6 +774,105 @@ describe("company and payout profiles", () => {
     expect(updated?.logoUrl).toBe("https://cdn.example.com/logo.png");
   });
 
+  it("pages quote templates by search and registered business offering", async () => {
+    const db = new FakeDb() as unknown as Database;
+    const plumbing = await createCompany(db, "provider-1", {
+      businessName: "Tolu Plumbing",
+      serviceLine: "Plumbing",
+      customerPhone: "+2348000000000",
+    });
+    await createCompany(db, "provider-1", {
+      businessName: "Tolu Catering",
+      serviceLine: "Catering",
+      customerPhone: "+2348000000000",
+    });
+    await createQuote(db, "provider-1", {
+      companyId: plumbing.id,
+      customerName: "Ada",
+      customerPhone: "+2348000000000",
+      customerLocation: "Lagos",
+      prompt: "Sink repair",
+      jobTitle: "Kitchen sink repair",
+      description: "Repair a leaking kitchen sink",
+      items: [{ title: "Labour", quantityLabel: "1 job", unitAmount: 15000, totalAmount: 15000 }],
+      collectDeposit: true,
+    });
+
+    const page = await listQuotePage(db, "provider-1", {
+      filter: "all",
+      limit: 20,
+      offset: 0,
+      search: "sink",
+      serviceLine: "Plumbing",
+    });
+
+    expect(page.total).toBe(1);
+    expect(page.categories).toEqual(["Plumbing"]);
+    expect(page.quotes[0]).toMatchObject({
+      jobTitle: "Kitchen sink repair",
+      company: { serviceLine: "Plumbing" },
+    });
+  });
+
+  it("archives and deletes provider quotes", async () => {
+    const db = new FakeDb() as unknown as Database;
+    const first = await createQuote(db, "provider-1", {
+      customerName: "Ada",
+      customerPhone: "+2348000000000",
+      customerLocation: "Lagos",
+      prompt: "Fix a leaking sink",
+      collectDeposit: true,
+    });
+    const second = await createQuote(db, "provider-1", {
+      customerName: "Bola",
+      customerPhone: "+2348111111111",
+      customerLocation: "Abuja",
+      prompt: "Install kitchen tap",
+      collectDeposit: false,
+    });
+
+    expect(await listQuotes(db, "provider-1")).toHaveLength(2);
+    const firstQuote = first!;
+    const secondQuote = second!;
+
+    const archived = await archiveQuote(db, "provider-1", firstQuote.id);
+
+    expect(archived?.status).toBe("archived");
+    expect(await listQuotes(db, "provider-1")).toHaveLength(1);
+    expect(await getPublicQuoteBundle(db, firstQuote.publicSlug)).toBeNull();
+
+    const forbiddenDelete = await deleteQuote(db, "provider-2", secondQuote.id);
+    const deleted = await deleteQuote(db, "provider-1", secondQuote.id);
+
+    expect(forbiddenDelete).toBe(false);
+    expect(deleted).toBe(true);
+    expect(await listQuotes(db, "provider-1")).toHaveLength(0);
+  });
+
+  it("reuses one edit draft for an existing quote", async () => {
+    const db = new FakeDb() as unknown as Database;
+    const quote = await createQuote(db, "provider-1", {
+      customerName: "Ada",
+      customerPhone: "+2348000000000",
+      customerLocation: "Lagos",
+      prompt: "Fix bathroom piping",
+      collectDeposit: true,
+    });
+    const sent = await recordQuoteSend(db, "provider-1", quote!.id, {
+      channel: "whatsapp",
+    });
+    const createdQuote = quote!;
+
+    expect(sent?.quote.status).toBe("sent");
+
+    const firstDraft = await getOrCreateQuoteEditDraft(db, "provider-1", createdQuote.id);
+    const secondDraft = await getOrCreateQuoteEditDraft(db, "provider-1", createdQuote.id);
+
+    expect(firstDraft?.status).toBe("draft");
+    expect(secondDraft?.id).toBe(firstDraft?.id);
+    expect(await listQuotes(db, "provider-1")).toHaveLength(2);
+  });
+
   it("smoke tests quote send, public activity, payment, dashboard, and earnings", async () => {
     const db = new FakeDb() as unknown as Database;
     const company = await createCompany(db, "provider-1", {
@@ -621,8 +921,8 @@ describe("company and payout profiles", () => {
     const publicBundle = await getPublicQuoteBundle(db, createdQuote.publicSlug);
 
     expect(sent?.quote.status).toBe("sent");
-    expect(viewed?.quote.status).toBe("viewed");
-    expect(accepted?.quote.status).toBe("accepted");
+    expect(viewed?.bundle.quote.status).toBe("viewed");
+    expect(accepted?.bundle.quote.status).toBe("accepted");
     expect(publicBundle?.quote.status).toBe("partial");
     expect(publicBundle?.timeline.map((event) => event.kind)).toEqual([
       "drafted",

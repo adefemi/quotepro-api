@@ -12,7 +12,7 @@ The backend is designed to run through Docker Compose in local development and o
 
 1. Copy `.env.example` to `.env`.
 2. Keep `MOCK_PAYMENTS=true` for local payment redirects.
-3. Leave `OPENAI_API_KEY` empty to use the built-in deterministic quote generator locally, or set it to test AI quote generation with `OPENAI_QUOTE_MODEL=gpt-5-nano` and `OPENAI_QUOTE_FALLBACK_MODEL=gpt-4.1-mini`.
+3. Set `OPENAI_API_KEY` to enable AI quote generation with `OPENAI_QUOTE_MODEL=gpt-5.3-chat-latest`.
 4. If another local Postgres already uses `5432`, set `POSTGRES_PORT=55432` or another free host port. The API still talks to Postgres inside Docker on container port `5432`.
 5. Start the backend:
 
@@ -44,12 +44,12 @@ MOCK_PAYMENTS=false
 PAYSTACK_SECRET_KEY=<paystack-secret>
 PAYSTACK_WEBHOOK_SECRET=<optional-webhook-signing-secret>
 OPENAI_API_KEY=<openai-api-key>
-OPENAI_QUOTE_MODEL=gpt-5-nano
-OPENAI_QUOTE_FALLBACK_MODEL=gpt-4.1-mini
-OPENAI_REQUEST_TIMEOUT_MS=8000
+OPENAI_QUOTE_MODEL=gpt-5.3-chat-latest
+OPENAI_QUOTE_FALLBACK_MODEL=gpt-5.3-chat-latest
+OPENAI_REQUEST_TIMEOUT_MS=25000
 ```
 
-AI quote generation is bounded by `OPENAI_REQUEST_TIMEOUT_MS`. If the primary model times out, the API falls back to the deterministic quote generator instead of waiting for another AI attempt, which keeps quote creation below common mobile and reverse-proxy timeout limits.
+AI quote generation is bounded by `OPENAI_REQUEST_TIMEOUT_MS`. When an OpenAI key is configured, the API does not return deterministic fallback quotes; generation either returns an AI quote or asks the user to retry.
 
 If `PAYSTACK_WEBHOOK_SECRET` is empty, the API verifies webhook signatures with `PAYSTACK_SECRET_KEY`.
 

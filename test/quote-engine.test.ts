@@ -62,35 +62,48 @@ describe("generateQuoteFromPrompt", () => {
       },
       {
         openAiApiKey: "test-key",
-        openAiModel: "gpt-5-nano",
+        openAiModel: "gpt-5.3-chat-latest",
         openAiBaseUrl: "https://api.openai.test/v1",
         fetchFn: fakeFetch,
       },
     );
 
     expect(request?.url).toBe("https://api.openai.test/v1/responses");
-    expect(request?.body.model).toBe("gpt-5-nano");
+    expect(request?.body.model).toBe("gpt-5.3-chat-latest");
     expect(quote.jobTitle).toBe("Shop wiring installation");
     expect(quote.items).toHaveLength(2);
     expect(quote.totalAmount).toBe(172000);
     expect(quote.depositAmount).toBe(86000);
   });
 
-  it("falls back to deterministic generation when OpenAI returns malformed output", async () => {
+  it("fails visibly instead of using deterministic output when configured AI returns malformed output", async () => {
     const fakeFetch: OpenAiFetch = async () => ({
       ok: true,
       status: 200,
       json: async () => ({ output_text: JSON.stringify({ jobTitle: "Incomplete quote" }) }),
     });
 
+    await expect(
+      generateQuoteFromPrompt(
+        {
+          prompt: "General repair work",
+          collectDeposit: true,
+        },
+        {
+          openAiApiKey: "test-key",
+          openAiModel: "gpt-5.3-chat-latest",
+          openAiFallbackModel: "gpt-5.3-chat-latest",
+          fetchFn: fakeFetch,
+        },
+      ),
+    ).rejects.toThrow("AI quote generation failed");
+  });
+
+  it("uses deterministic generation only when no OpenAI key is configured", async () => {
     const quote = await generateQuoteFromPrompt(
       {
         prompt: "General repair work",
         collectDeposit: true,
-      },
-      {
-        openAiApiKey: "test-key",
-        fetchFn: fakeFetch,
       },
     );
 
@@ -98,13 +111,13 @@ describe("generateQuoteFromPrompt", () => {
     expect(quote.totalAmount).toBe(204250);
   });
 
-  it("tries the configured backup model before deterministic fallback", async () => {
+  it("tries the configured backup AI model before failing", async () => {
     const attemptedModels: string[] = [];
     const fakeFetch: OpenAiFetch = async (_url, init) => {
       const body = JSON.parse(init.body) as { model: string };
       attemptedModels.push(body.model);
 
-      if (body.model === "gpt-5-nano") {
+      if (body.model === "gpt-5.3-chat-latest") {
         return {
           ok: false,
           status: 500,
@@ -139,23 +152,45 @@ describe("generateQuoteFromPrompt", () => {
       },
       {
         openAiApiKey: "test-key",
-        openAiModel: "gpt-5-nano",
-        openAiFallbackModel: "gpt-4.1-mini",
+        openAiModel: "gpt-5.3-chat-latest",
+        openAiFallbackModel: "gpt-5.4-nano",
         fetchFn: fakeFetch,
       },
     );
 
-    expect(attemptedModels).toEqual(["gpt-5-nano", "gpt-4.1-mini"]);
+    expect(attemptedModels).toEqual(["gpt-5.3-chat-latest", "gpt-5.4-nano"]);
     expect(quote.jobTitle).toBe("Backup model quote");
     expect(quote.depositAmount).toBe(0);
   });
 
-  it("does not try the backup model after an OpenAI timeout", async () => {
+  it("tries the backup AI model after an OpenAI timeout", async () => {
     const attemptedModels: string[] = [];
     const fakeFetch: OpenAiFetch = async (_url, init) => {
       const body = JSON.parse(init.body) as { model: string };
       attemptedModels.push(body.model);
-      throw Object.assign(new Error("Request aborted"), { name: "AbortError" });
+
+      if (body.model === "gpt-5.3-chat-latest") {
+        throw Object.assign(new Error("Request aborted"), { name: "AbortError" });
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          output_text: JSON.stringify({
+            jobTitle: "Backup after timeout",
+            description: "Quote generated after retrying with the backup model.",
+            items: [
+              {
+                title: "Service labour",
+                quantityLabel: "1 job",
+                unitAmount: 50000,
+                totalAmount: 50000,
+              },
+            ],
+          }),
+        }),
+      };
     };
 
     const quote = await generateQuoteFromPrompt(
@@ -165,13 +200,13 @@ describe("generateQuoteFromPrompt", () => {
       },
       {
         openAiApiKey: "test-key",
-        openAiModel: "gpt-5-nano",
-        openAiFallbackModel: "gpt-4.1-mini",
+        openAiModel: "gpt-5.3-chat-latest",
+        openAiFallbackModel: "gpt-5.4-nano",
         fetchFn: fakeFetch,
       },
     );
 
-    expect(attemptedModels).toEqual(["gpt-5-nano"]);
-    expect(quote.jobTitle).toBe("Custom service job");
+    expect(attemptedModels).toEqual(["gpt-5.3-chat-latest", "gpt-5.4-nano"]);
+    expect(quote.jobTitle).toBe("Backup after timeout");
   });
 });

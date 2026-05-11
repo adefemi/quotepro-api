@@ -84,9 +84,9 @@ CORS_ORIGINS=https://your-client-web-domain
 MOCK_PAYMENTS=false
 PAYSTACK_SECRET_KEY=<paystack-secret>
 OPENAI_API_KEY=<openai-api-key>
-OPENAI_QUOTE_MODEL=gpt-5-nano
-OPENAI_QUOTE_FALLBACK_MODEL=gpt-4.1-mini
-OPENAI_REQUEST_TIMEOUT_MS=8000
+OPENAI_QUOTE_MODEL=gpt-5.3-chat-latest
+OPENAI_QUOTE_FALLBACK_MODEL=gpt-5.3-chat-latest
+OPENAI_REQUEST_TIMEOUT_MS=25000
 ```
 
 After adding HTTPS and a domain, configure Paystack webhook:

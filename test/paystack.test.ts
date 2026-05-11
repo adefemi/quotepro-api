@@ -18,6 +18,13 @@ describe("mapPaystackWebhookEvent", () => {
       quoteEvent: "ignored",
     });
   });
+
+  it("maps failed charges to payment_failed", () => {
+    expect(mapPaystackWebhookEvent("charge.failed")).toMatchObject({
+      paymentStatus: "failed",
+      quoteEvent: "payment_failed",
+    });
+  });
 });
 
 describe("verifyPaystackSignature", () => {
