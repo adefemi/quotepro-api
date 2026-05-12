@@ -425,6 +425,42 @@ describe("payments HTTP routes", () => {
     expect(wrongQuote.statusCode).toBe(404);
   });
 
+  it("verifies initialized payments when the status endpoint is polled", async () => {
+    const fake = new PaymentRoutesFakeDb();
+    fake.seedProvider();
+    const quote = fake.seedDepositQuote({
+      public_slug: "POLL-SLUG",
+      quote_number: "Q-POLL",
+    });
+    fake.payments.set("ref_poll", {
+      quote_id: quote.id,
+      paystack_reference: "ref_poll",
+      email: "buyer@example.com",
+      channel: "card",
+      amount: 50_000,
+      status: "initialized",
+      paid_at: null,
+      raw_payload: null,
+    });
+
+    const app = await makeApp(fake as unknown as Database);
+    apps.add(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/payments/ref_poll/status?publicSlug=POLL-SLUG",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      quoteId: "Q-POLL",
+      reference: "ref_poll",
+      status: "paid",
+    });
+    expect(fake.payments.get("ref_poll")?.status).toBe("paid");
+    expect(quote.status).toBe("partial");
+  });
+
   it("verifies an initialized payment and applies the confirmed transition", async () => {
     const fake = new PaymentRoutesFakeDb();
     fake.seedProvider();

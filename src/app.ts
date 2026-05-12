@@ -137,6 +137,35 @@ export function buildApp(
     }
   }
 
+  async function verifyPendingPayment(input: { reference: string; publicSlug: string }) {
+    const existingPayment = await getPublicPaymentByReference(db, input);
+
+    if (!existingPayment) {
+      return null;
+    }
+
+    if (existingPayment.status === "paid" || existingPayment.status === "failed") {
+      return existingPayment;
+    }
+
+    try {
+      const verification = await verifyPaystackTransaction(input.reference);
+      const transitionResult = await applyPaymentTransition(db, {
+        reference: input.reference,
+        status: verification.paymentStatus,
+        eventLabel: verification.eventLabel,
+        rawPayload: verification.rawPayload,
+      });
+
+      await maybeDispatchPush(transitionResult?.pushTarget);
+    } catch (error) {
+      app.log.error(error);
+      return existingPayment;
+    }
+
+    return getPublicPaymentByReference(db, input);
+  }
+
   app.removeContentTypeParser("application/json");
   app.addContentTypeParser("application/json", { parseAs: "string" }, (request, body, done) => {
     const rawBody = typeof body === "string" ? body : body.toString("utf8");
@@ -784,7 +813,7 @@ export function buildApp(
       return reply.code(400).send({ message: "publicSlug is required." });
     }
 
-    const payment = await getPublicPaymentByReference(db, { publicSlug, reference });
+    const payment = await verifyPendingPayment({ publicSlug, reference });
 
     if (!payment) {
       return reply.code(404).send({ message: "Payment not found." });
@@ -801,27 +830,7 @@ export function buildApp(
       return reply.code(400).send({ message: "publicSlug is required." });
     }
 
-    const existingPayment = await getPublicPaymentByReference(db, { publicSlug, reference });
-
-    if (!existingPayment) {
-      return reply.code(404).send({ message: "Payment not found." });
-    }
-
-    if (existingPayment.status === "paid") {
-      return existingPayment;
-    }
-
-    const verification = await verifyPaystackTransaction(reference);
-    const transitionResult = await applyPaymentTransition(db, {
-      reference,
-      status: verification.paymentStatus,
-      eventLabel: verification.eventLabel,
-      rawPayload: verification.rawPayload,
-    });
-
-    await maybeDispatchPush(transitionResult?.pushTarget);
-
-    const payment = await getPublicPaymentByReference(db, { publicSlug, reference });
+    const payment = await verifyPendingPayment({ publicSlug, reference });
 
     if (!payment) {
       return reply.code(404).send({ message: "Payment not found." });
