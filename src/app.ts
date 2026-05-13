@@ -8,6 +8,7 @@ import type { Database } from "./db/pool.js";
 import {
   companyProfileSchema,
   createQuoteSchema,
+  googleSignInSchema,
   initializePaymentSchema,
   otpStartSchema,
   otpVerifySchema,
@@ -49,12 +50,14 @@ import {
   getPublicQuoteBundle,
   listQuotePage,
   listQuotes,
+  PhoneOtpDeliveryError,
   recordPublicAccept,
   recordPublicView,
   recordQuoteSend,
   savePayoutAccount,
   saveProviderPin,
   setDefaultPayoutAccount,
+  signInWithGoogle,
   startPhoneOtp,
   updateCompany,
   updateCompanyLogo,
@@ -63,6 +66,16 @@ import {
   upsertPushDevice,
   verifyPhoneOtp,
 } from "./repository.js";
+import {
+  GoogleAuthConfigError,
+  GoogleAuthVerificationError,
+  verifyGoogleIdToken,
+  type GoogleProfile,
+} from "./auth/google.js";
+import {
+  createWhatsAppOtpSender,
+  type WhatsAppOtpSender,
+} from "./notifications/whatsapp.js";
 import {
   createPaystackTransferRecipient,
   initializePayment,
@@ -84,6 +97,7 @@ import {
 type RawBodyRequest = FastifyRequest & { rawBody?: string };
 type LogoUploader = (input: { providerId: string; companyId: string; file: CompanyLogoFile }) => Promise<string>;
 type QuotePushDispatch = (db: Database, payload: NotificationPushPayload) => Promise<void>;
+type GoogleIdTokenVerifier = (idToken: string) => Promise<GoogleProfile>;
 
 async function verifyPayoutAccount(input: { bankName: string; bankCode: string; accountNumber: string }) {
   const resolved = await resolvePaystackBankAccount({
@@ -117,13 +131,23 @@ function getBearerToken(request: FastifyRequest) {
 
 export function buildApp(
   db: Database,
-  options: { logoUploader?: LogoUploader; pushDispatch?: QuotePushDispatch } = {},
+  options: {
+    logoUploader?: LogoUploader;
+    pushDispatch?: QuotePushDispatch;
+    otpSender?: WhatsAppOtpSender;
+    googleIdTokenVerifier?: GoogleIdTokenVerifier;
+    exposeOtpCode?: boolean;
+  } = {},
 ) {
   const app = Fastify({
     logger: true,
   });
   const logoUploader = options.logoUploader ?? uploadCompanyLogoToS3;
   const runQuotePush = options.pushDispatch ?? dispatchQuotePush;
+  const otpSender = options.otpSender ?? createWhatsAppOtpSender();
+  const googleVerifier =
+    options.googleIdTokenVerifier ?? ((idToken: string) => verifyGoogleIdToken(idToken));
+  const exposeOtpCode = options.exposeOtpCode ?? env.EXPOSE_OTP_CODE;
 
   async function maybeDispatchPush(payload: NotificationPushPayload | undefined) {
     if (!payload) {
@@ -221,7 +245,52 @@ export function buildApp(
 
   app.post("/auth/otp/start", async (request, reply) => {
     const body = otpStartSchema.parse(request.body);
-    return reply.code(201).send(await startPhoneOtp(db, body));
+    try {
+      const result = await startPhoneOtp(db, body, {
+        sender: otpSender,
+        exposeCode: exposeOtpCode,
+      });
+      return reply.code(201).send(result);
+    } catch (error) {
+      if (error instanceof PhoneOtpDeliveryError) {
+        request.log.error({ err: error }, "WhatsApp OTP delivery failed");
+        return reply.code(503).send({
+          message: "We could not send the WhatsApp OTP right now. Please try again shortly.",
+        });
+      }
+
+      throw error;
+    }
+  });
+
+  app.post("/auth/google", async (request, reply) => {
+    const body = googleSignInSchema.parse(request.body);
+
+    let profile: GoogleProfile;
+    try {
+      profile = await googleVerifier(body.idToken);
+    } catch (error) {
+      if (error instanceof GoogleAuthConfigError) {
+        request.log.error({ err: error }, "Google sign-in is not configured");
+        return reply.code(503).send({
+          message: "Google sign-in is not configured on the server.",
+        });
+      }
+
+      if (error instanceof GoogleAuthVerificationError) {
+        return reply.code(401).send({ message: error.message });
+      }
+
+      throw error;
+    }
+
+    const existingProvider = await requireProvider(request);
+    const session = await signInWithGoogle(db, {
+      profile,
+      existingProviderId: existingProvider?.id,
+    });
+
+    return reply.code(201).send(session);
   });
 
   app.post("/auth/otp/verify", async (request, reply) => {

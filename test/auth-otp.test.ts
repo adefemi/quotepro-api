@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildApp } from "../src/app.js";
 import type { Database } from "../src/db/pool.js";
+import { WhatsAppConfigError, WhatsAppDeliveryError } from "../src/notifications/whatsapp.js";
 
 type ProviderRow = {
   id: string;
@@ -13,6 +14,9 @@ type ProviderRow = {
   pin_hash: string | null;
   pin_set_at: Date | null;
   has_logo: boolean;
+  google_sub: string | null;
+  google_email: string | null;
+  google_picture_url: string | null;
 };
 
 class FakeDb {
@@ -42,7 +46,11 @@ class FakeDb {
 
     if (normalized.startsWith("insert into providers (account_phone")) {
       const phone = params[0] as string;
-      const provider = this.createProvider({ account_phone: phone, customer_phone: phone, phone_verified_at: new Date() });
+      const provider = this.createProvider({
+        account_phone: phone,
+        customer_phone: phone,
+        phone_verified_at: new Date(),
+      });
       return { rows: [{ id: provider.id }] };
     }
 
@@ -64,7 +72,10 @@ class FakeDb {
       return { rows: otp ? [otp] : [] };
     }
 
-    if (normalized.startsWith("select id::text from providers where account_phone") && normalized.includes("pin_hash = crypt")) {
+    if (
+      normalized.startsWith("select id::text from providers where account_phone") &&
+      normalized.includes("pin_hash = crypt")
+    ) {
       const phone = params[0] as string;
       const pin = params[1] as string;
       const provider = [...this.providers.values()].find(
@@ -135,6 +146,9 @@ class FakeDb {
       pin_hash: null,
       pin_set_at: null,
       has_logo: false,
+      google_sub: null,
+      google_email: null,
+      google_picture_url: null,
       ...input,
     };
     this.providers.set(id, provider);
@@ -158,9 +172,18 @@ describe("phone OTP auth", () => {
     apps.clear();
   });
 
-  it("starts OTP and verifies a new phone account", async () => {
-    const app = buildApp(new FakeDb() as unknown as Database);
+  function buildTestApp(db: FakeDb, sender = vi.fn(async () => undefined)) {
+    const app = buildApp(db as unknown as Database, {
+      otpSender: sender,
+      exposeOtpCode: true,
+    });
     apps.add(app);
+    return { app, sender };
+  }
+
+  it("starts OTP, sends it via WhatsApp, and verifies a new phone account", async () => {
+    const sender = vi.fn(async () => undefined);
+    const { app } = buildTestApp(new FakeDb(), sender);
 
     const start = await app.inject({
       method: "POST",
@@ -168,12 +191,22 @@ describe("phone OTP auth", () => {
       payload: { phone: "+2348032214490" },
     });
     expect(start.statusCode).toBe(201);
-    expect(start.json()).toMatchObject({ phone: "+2348032214490", code: "123456" });
+    const startBody = start.json();
+    expect(startBody).toMatchObject({
+      phone: "+2348032214490",
+      channel: "whatsapp",
+      delivered: true,
+    });
+    expect(startBody.code).toMatch(/^\d{6}$/);
+    expect(sender).toHaveBeenCalledWith({
+      phone: "+2348032214490",
+      code: startBody.code,
+    });
 
     const verify = await app.inject({
       method: "POST",
       url: "/auth/otp/verify",
-      payload: { phone: "+2348032214490", code: "123456" },
+      payload: { phone: "+2348032214490", code: startBody.code },
     });
     expect(verify.statusCode).toBe(200);
     expect(verify.json()).toMatchObject({
@@ -186,9 +219,28 @@ describe("phone OTP auth", () => {
     });
   });
 
+  it("rejects OTP codes that do not match what was sent", async () => {
+    const { app } = buildTestApp(new FakeDb());
+
+    const start = await app.inject({
+      method: "POST",
+      url: "/auth/otp/start",
+      payload: { phone: "+2348032214490" },
+    });
+    const sentCode = start.json().code as string;
+    const wrongCode = sentCode === "000000" ? "111111" : "000000";
+
+    const verify = await app.inject({
+      method: "POST",
+      url: "/auth/otp/verify",
+      payload: { phone: "+2348032214490", code: wrongCode },
+    });
+    expect(verify.statusCode).toBe(400);
+    expect(verify.json()).toMatchObject({ message: "Invalid or expired OTP." });
+  });
+
   it("attaches OTP verification to an existing draft session", async () => {
-    const app = buildApp(new FakeDb() as unknown as Database);
-    apps.add(app);
+    const { app } = buildTestApp(new FakeDb());
 
     const session = await app.inject({
       method: "POST",
@@ -197,7 +249,7 @@ describe("phone OTP auth", () => {
     });
     const token = session.json().token as string;
 
-    await app.inject({
+    const start = await app.inject({
       method: "POST",
       url: "/auth/otp/start",
       payload: { phone: "+2348032214490" },
@@ -206,7 +258,7 @@ describe("phone OTP auth", () => {
       method: "POST",
       url: "/auth/otp/verify",
       headers: { authorization: `Bearer ${token}` },
-      payload: { phone: "+2348032214490", code: "123456" },
+      payload: { phone: "+2348032214490", code: start.json().code as string },
     });
 
     expect(verify.statusCode).toBe(200);
@@ -219,10 +271,9 @@ describe("phone OTP auth", () => {
   });
 
   it("sets a PIN after OTP signup and logs in with that PIN", async () => {
-    const app = buildApp(new FakeDb() as unknown as Database);
-    apps.add(app);
+    const { app } = buildTestApp(new FakeDb());
 
-    await app.inject({
+    const start = await app.inject({
       method: "POST",
       url: "/auth/otp/start",
       payload: { phone: "+2348032214490" },
@@ -230,7 +281,7 @@ describe("phone OTP auth", () => {
     const verify = await app.inject({
       method: "POST",
       url: "/auth/otp/verify",
-      payload: { phone: "+2348032214490", code: "123456" },
+      payload: { phone: "+2348032214490", code: start.json().code as string },
     });
     const signupToken = verify.json().token as string;
 
@@ -265,10 +316,9 @@ describe("phone OTP auth", () => {
 
   it("rejects an invalid PIN without creating another provider", async () => {
     const db = new FakeDb();
-    const app = buildApp(db as unknown as Database);
-    apps.add(app);
+    const { app } = buildTestApp(db);
 
-    await app.inject({
+    const start = await app.inject({
       method: "POST",
       url: "/auth/otp/start",
       payload: { phone: "+2348032214490" },
@@ -276,7 +326,7 @@ describe("phone OTP auth", () => {
     const verify = await app.inject({
       method: "POST",
       url: "/auth/otp/verify",
-      payload: { phone: "+2348032214490", code: "123456" },
+      payload: { phone: "+2348032214490", code: start.json().code as string },
     });
     await app.inject({
       method: "PUT",
@@ -298,8 +348,7 @@ describe("phone OTP auth", () => {
 
   it("does not create a provider when PIN login uses an unknown phone", async () => {
     const db = new FakeDb();
-    const app = buildApp(db as unknown as Database);
-    apps.add(app);
+    const { app } = buildTestApp(db);
 
     const login = await app.inject({
       method: "POST",
@@ -309,5 +358,71 @@ describe("phone OTP auth", () => {
 
     expect(login.statusCode).toBe(401);
     expect(db.providers.size).toBe(0);
+  });
+
+  it("returns 503 when WhatsApp delivery fails", async () => {
+    const sender = vi.fn(async () => {
+      throw new WhatsAppDeliveryError("upstream 500", 500, "boom");
+    });
+    const app = buildApp(new FakeDb() as unknown as Database, {
+      otpSender: sender,
+      exposeOtpCode: true,
+    });
+    apps.add(app);
+
+    const start = await app.inject({
+      method: "POST",
+      url: "/auth/otp/start",
+      payload: { phone: "+2348032214490" },
+    });
+
+    expect(start.statusCode).toBe(503);
+    expect(start.json()).toMatchObject({
+      message: expect.stringContaining("WhatsApp"),
+    });
+  });
+
+  it("propagates WhatsApp config errors as 503 when codes are not exposed", async () => {
+    const sender = vi.fn(async () => {
+      throw new WhatsAppConfigError("missing access token");
+    });
+    const app = buildApp(new FakeDb() as unknown as Database, {
+      otpSender: sender,
+      exposeOtpCode: false,
+    });
+    apps.add(app);
+
+    const start = await app.inject({
+      method: "POST",
+      url: "/auth/otp/start",
+      payload: { phone: "+2348032214490" },
+    });
+
+    expect(start.statusCode).toBe(503);
+  });
+
+  it("still stores the OTP when the sender is unconfigured but codes are exposed (dev mode)", async () => {
+    const sender = vi.fn(async () => {
+      throw new WhatsAppConfigError("missing access token");
+    });
+    const db = new FakeDb();
+    const app = buildApp(db as unknown as Database, {
+      otpSender: sender,
+      exposeOtpCode: true,
+    });
+    apps.add(app);
+
+    const start = await app.inject({
+      method: "POST",
+      url: "/auth/otp/start",
+      payload: { phone: "+2348032214490" },
+    });
+
+    expect(start.statusCode).toBe(201);
+    expect(start.json()).toMatchObject({
+      phone: "+2348032214490",
+      delivered: false,
+    });
+    expect(db.otps.size).toBe(1);
   });
 });

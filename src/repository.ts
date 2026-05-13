@@ -1,6 +1,13 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
 
 import type { QueryResultRow } from "pg";
+
+import type { GoogleProfile } from "./auth/google.js";
+import {
+  type WhatsAppOtpSender,
+  WhatsAppConfigError,
+  WhatsAppDeliveryError,
+} from "./notifications/whatsapp.js";
 
 import type {
   CompanyProfileDto,
@@ -88,13 +95,19 @@ function mapProvider(row: QueryResultRow): ProviderProfileDto {
     serviceLine: row.service_line,
     customerPhone: row.customer_phone,
     accountPhone: row.account_phone ?? undefined,
-    hasAccount: Boolean(row.phone_verified_at),
+    googleEmail: row.google_email ?? undefined,
+    googlePictureUrl: row.google_picture_url ?? undefined,
+    hasAccount: Boolean(row.phone_verified_at) || Boolean(row.google_sub),
     hasPin: Boolean(row.pin_set_at),
     hasLogo: row.has_logo,
     hasPayoutAccount: Boolean(row.payout_bank_name),
     payoutBankName: row.payout_bank_name ?? undefined,
     payoutAccountLast4: row.account_number_last4 ?? undefined,
   };
+}
+
+function generateOtpCode(): string {
+  return randomInt(0, 1_000_000).toString().padStart(6, "0");
 }
 
 function mapCompany(row: QueryResultRow): CompanyProfileDto {
@@ -476,8 +489,30 @@ export async function createSession(db: Database, input: { channel: string }) {
   });
 }
 
-export async function startPhoneOtp(db: Database, input: { phone: string }) {
-  const code = "123456";
+export interface StartPhoneOtpResult {
+  phone: string;
+  expiresAt: string;
+  channel: "whatsapp";
+  delivered: boolean;
+  code?: string;
+}
+
+export class PhoneOtpDeliveryError extends Error {
+  readonly cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "PhoneOtpDeliveryError";
+    this.cause = cause;
+  }
+}
+
+export async function startPhoneOtp(
+  db: Database,
+  input: { phone: string },
+  options: { sender?: WhatsAppOtpSender; exposeCode?: boolean } = {},
+): Promise<StartPhoneOtpResult> {
+  const code = generateOtpCode();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
   await db.query(
@@ -490,11 +525,43 @@ export async function startPhoneOtp(db: Database, input: { phone: string }) {
     [input.phone, code, expiresAt],
   );
 
-  return {
+  const sender = options.sender;
+  let delivered = false;
+  if (sender) {
+    try {
+      await sender({ phone: input.phone, code });
+      delivered = true;
+    } catch (error) {
+      if (error instanceof WhatsAppConfigError) {
+        if (!options.exposeCode) {
+          throw new PhoneOtpDeliveryError(
+            "WhatsApp delivery is not configured.",
+            error,
+          );
+        }
+      } else if (error instanceof WhatsAppDeliveryError) {
+        throw new PhoneOtpDeliveryError(
+          "Failed to deliver OTP via WhatsApp.",
+          error,
+        );
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  const result: StartPhoneOtpResult = {
     phone: input.phone,
     expiresAt: expiresAt.toISOString(),
-    code,
+    channel: "whatsapp",
+    delivered,
   };
+
+  if (options.exposeCode) {
+    result.code = code;
+  }
+
+  return result;
 }
 
 export async function verifyPhoneOtp(
@@ -586,6 +653,82 @@ export async function saveProviderPin(db: Database, providerId: string, input: {
   return getProviderById(db, result.rows[0].id);
 }
 
+export async function signInWithGoogle(
+  db: Database,
+  input: { profile: GoogleProfile; existingProviderId?: string },
+) {
+  const { profile, existingProviderId } = input;
+
+  return withTransaction(db, async (client) => {
+    const bySub = await client.query(
+      "select id::text from providers where google_sub = $1 limit 1",
+      [profile.sub],
+    );
+
+    let providerId: string | undefined = bySub.rows[0]?.id;
+
+    if (!providerId) {
+      const byEmail = await client.query(
+        "select id::text from providers where lower(google_email) = lower($1) limit 1",
+        [profile.email],
+      );
+      providerId = byEmail.rows[0]?.id;
+    }
+
+    if (!providerId && existingProviderId) {
+      const draft = await client.query(
+        "select id::text from providers where id = $1 and google_sub is null limit 1",
+        [existingProviderId],
+      );
+      providerId = draft.rows[0]?.id;
+    }
+
+    if (providerId) {
+      await client.query(
+        `
+          update providers
+          set google_sub = $2,
+            google_email = $3,
+            google_picture_url = coalesce($4, google_picture_url),
+            business_name = case when business_name = '' and $5 <> '' then $5 else business_name end
+          where id = $1
+        `,
+        [
+          providerId,
+          profile.sub,
+          profile.email,
+          profile.pictureUrl ?? null,
+          profile.name,
+        ],
+      );
+    } else {
+      const inserted = await client.query(
+        `
+          insert into providers (business_name, google_sub, google_email, google_picture_url)
+          values ($1, $2, $3, $4)
+          returning id::text
+        `,
+        [profile.name, profile.sub, profile.email, profile.pictureUrl ?? null],
+      );
+      providerId = inserted.rows[0].id as string;
+    }
+
+    const sessionToken = token();
+    await client.query(
+      `
+        insert into provider_sessions (provider_id, token, channel)
+        values ($1, $2, 'google')
+      `,
+      [providerId, sessionToken],
+    );
+
+    return {
+      token: sessionToken,
+      provider: await getProviderById(client, providerId),
+    };
+  });
+}
+
 export async function loginWithPin(db: Database, input: { phone: string; pin: string }) {
   return withTransaction(db, async (client) => {
     const provider = await client.query(
@@ -627,6 +770,7 @@ export async function getProviderById(db: DatabaseClient, providerId: string): P
     `
       select p.id::text, p.business_name, p.service_line, p.customer_phone,
         p.account_phone, p.phone_verified_at, p.pin_set_at, p.has_logo,
+        p.google_sub, p.google_email, p.google_picture_url,
         pa.bank_name as payout_bank_name,
         pa.account_number_last4
       from providers p
@@ -654,6 +798,7 @@ export async function getProviderByToken(db: DatabaseClient, bearerToken: string
     `
       select p.id::text, p.business_name, p.service_line, p.customer_phone,
         p.account_phone, p.phone_verified_at, p.pin_set_at, p.has_logo,
+        p.google_sub, p.google_email, p.google_picture_url,
         pa.bank_name as payout_bank_name,
         pa.account_number_last4
       from provider_sessions s

@@ -12,6 +12,8 @@ export interface ProviderProfileDto {
   serviceLine: string;
   customerPhone: string;
   accountPhone?: string;
+  googleEmail?: string;
+  googlePictureUrl?: string;
   hasAccount: boolean;
   hasPin: boolean;
   hasLogo: boolean;
@@ -97,6 +99,10 @@ export interface PaymentRecordDto {
 
 export const signInSchema = z.object({
   channel: z.enum(["google", "phone", "demo"]).default("demo"),
+});
+
+export const googleSignInSchema = z.object({
+  idToken: z.string().trim().min(10),
 });
 
 export const otpStartSchema = z.object({
