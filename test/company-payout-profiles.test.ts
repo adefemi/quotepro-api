@@ -370,6 +370,15 @@ class FakeDb {
       return { rows: [] };
     }
 
+    if (normalized.startsWith("update quotes set status = $2")) {
+      const quote = this.quotes.get(params[0] as string);
+      if (quote) {
+        quote.status = params[1] as string;
+        quote.paid_at = quote.paid_at ?? new Date();
+      }
+      return { rows: [] };
+    }
+
     if (normalized.startsWith("insert into provider_notifications")) {
       return { rows: [{ id: `notif-${this.nextId++}` }] };
     }
@@ -604,6 +613,10 @@ class FakeDb {
             };
           }),
       };
+    }
+
+    if (normalized.includes("from quote_client_feedback qcf")) {
+      return { rows: [] };
     }
 
     throw new Error(`Unhandled fake query: ${normalized}`);

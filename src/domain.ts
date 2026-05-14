@@ -2,9 +2,11 @@ import { z } from "zod";
 
 export const quoteStatuses = ["draft", "sent", "viewed", "accepted", "partial", "paid", "expired", "archived"] as const;
 export const paymentStatuses = ["pending", "initialized", "paid", "failed"] as const;
+export const paymentPurposes = ["deposit", "balance"] as const;
 
 export type QuoteStatus = (typeof quoteStatuses)[number];
 export type PaymentStatus = (typeof paymentStatuses)[number];
+export type PaymentPurpose = (typeof paymentPurposes)[number];
 
 export interface ProviderProfileDto {
   id: string;
@@ -83,10 +85,20 @@ export interface QuoteEventDto {
   at: string;
 }
 
+export interface QuoteClientFeedbackDto {
+  id: string;
+  quoteId: string;
+  type: "revision_request" | "review";
+  message: string;
+  rating?: number;
+  createdAt: string;
+}
+
 export interface QuoteBundleDto {
   quote: QuoteDto;
   provider: ProviderProfileDto;
   timeline: QuoteEventDto[];
+  feedback: QuoteClientFeedbackDto[];
 }
 
 export interface PaymentRecordDto {
@@ -95,6 +107,7 @@ export interface PaymentRecordDto {
   amount: number;
   reference: string;
   status: PaymentStatus;
+  purpose: PaymentPurpose;
 }
 
 export const signInSchema = z.object({
@@ -169,6 +182,7 @@ export const createQuoteSchema = z.object({
 });
 
 export const updateQuoteSchema = z.object({
+  aiEditMode: z.enum(["replace", "applyAdditionalInfo"]).optional().default("replace"),
   collectDeposit: z.boolean().optional(),
   status: z.enum(quoteStatuses).optional(),
   customerName: z.string().trim().min(1).optional(),
@@ -198,6 +212,16 @@ export const initializePaymentSchema = z.object({
   email: z.string().email(),
   channel: z.enum(["card", "bank_transfer", "ussd"]).default("card"),
   publicSlug: z.string().min(1),
+  purpose: z.enum(paymentPurposes).optional().default("deposit"),
+});
+
+export const revisionRequestSchema = z.object({
+  message: z.string().trim().min(3).max(2000),
+});
+
+export const quoteReviewSchema = z.object({
+  rating: z.number().int().min(1).max(5),
+  message: z.string().trim().min(3).max(2000),
 });
 
 export const pushTokenUpsertSchema = z.object({
@@ -221,7 +245,14 @@ export interface ProviderNotificationDto {
   createdAt: string;
 }
 
-export type NotificationPushKind = "viewed" | "accepted" | "deposit_paid" | "payment_failed";
+export type NotificationPushKind =
+  | "viewed"
+  | "accepted"
+  | "deposit_paid"
+  | "balance_paid"
+  | "payment_failed"
+  | "revision_requested"
+  | "review_received";
 
 export interface NotificationPushPayload {
   providerId: string;
@@ -234,5 +265,5 @@ export interface NotificationPushPayload {
 
 export interface QuotePublicActionResult {
   bundle: QuoteBundleDto;
-  pushTarget: NotificationPushPayload;
+  pushTarget?: NotificationPushPayload;
 }

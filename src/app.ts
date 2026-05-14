@@ -17,6 +17,8 @@ import {
   pinSchema,
   payoutSchema,
   providerProfileSchema,
+  quoteReviewSchema,
+  revisionRequestSchema,
   pushTokenDeleteSchema,
   pushTokenUpsertSchema,
   sendQuoteSchema,
@@ -32,6 +34,7 @@ import {
   createPayoutAccount,
   createQuote,
   createSession,
+  deleteProviderNotification,
   deletePushDevice,
   deleteQuote,
   getDashboard,
@@ -53,6 +56,7 @@ import {
   PhoneOtpDeliveryError,
   recordPublicAccept,
   recordPublicView,
+  recordQuoteClientFeedback,
   recordQuoteSend,
   savePayoutAccount,
   saveProviderPin,
@@ -420,6 +424,23 @@ export function buildApp(
 
     if (!ok) {
       return reply.code(404).send({ message: "Not found." });
+    }
+
+    return { ok: true };
+  });
+
+  app.delete("/providers/me/notifications/:notificationId", async (request, reply) => {
+    const provider = await requireProvider(request);
+
+    if (!provider) {
+      return reply.code(401).send({ message: "Unauthorized." });
+    }
+
+    const notificationId = (request.params as { notificationId: string }).notificationId;
+    const ok = await deleteProviderNotification(db, provider.id, notificationId);
+
+    if (!ok) {
+      return reply.code(404).send({ message: "Read notification not found." });
     }
 
     return { ok: true };
@@ -824,6 +845,39 @@ export function buildApp(
     return result.bundle;
   });
 
+  app.post("/public/quotes/:quoteId/revision-requests", async (request, reply) => {
+    const quoteId = (request.params as { quoteId: string }).quoteId;
+    const body = revisionRequestSchema.parse(request.body);
+    const result = await recordQuoteClientFeedback(db, quoteId, {
+      type: "revision_request",
+      message: body.message,
+    });
+
+    if (!result) {
+      return reply.code(404).send({ message: "Quote not found." });
+    }
+
+    await maybeDispatchPush(result.pushTarget);
+    return result.bundle;
+  });
+
+  app.post("/public/quotes/:quoteId/reviews", async (request, reply) => {
+    const quoteId = (request.params as { quoteId: string }).quoteId;
+    const body = quoteReviewSchema.parse(request.body);
+    const result = await recordQuoteClientFeedback(db, quoteId, {
+      type: "review",
+      message: body.message,
+      rating: body.rating,
+    });
+
+    if (!result) {
+      return reply.code(404).send({ message: "Quote not found." });
+    }
+
+    await maybeDispatchPush(result.pushTarget);
+    return result.bundle;
+  });
+
   app.post("/payments/initialize", async (request, reply) => {
     const body = initializePaymentSchema.parse(request.body);
     const bundle = await getPublicQuoteBundle(db, body.publicSlug);
@@ -832,15 +886,25 @@ export function buildApp(
       return reply.code(404).send({ message: "Quote not found." });
     }
 
-    if (!bundle.quote.collectDeposit || bundle.quote.depositAmount <= 0) {
+    if (body.purpose === "deposit" && (!bundle.quote.collectDeposit || bundle.quote.depositAmount <= 0)) {
       return reply.code(400).send({ message: "This quote does not require a deposit payment." });
     }
 
-    if (["partial", "paid", "expired"].includes(bundle.quote.status)) {
+    if (body.purpose === "deposit" && ["partial", "paid", "expired"].includes(bundle.quote.status)) {
       return reply.code(409).send({ message: "This quote is no longer accepting deposit payments." });
     }
 
-    const amount = bundle.quote.depositAmount;
+    if (body.purpose === "balance" && bundle.quote.status !== "partial") {
+      return reply.code(409).send({ message: "This quote is not ready for balance payment." });
+    }
+
+    const amount =
+      body.purpose === "balance"
+        ? Math.max(bundle.quote.totalAmount - bundle.quote.depositAmount, 0)
+        : bundle.quote.depositAmount;
+    if (amount <= 0) {
+      return reply.code(400).send({ message: "No payable amount is available for this quote." });
+    }
     const quoteId = bundle.quote.id;
 
     const result = await initializePayment({
@@ -858,13 +922,14 @@ export function buildApp(
       channel: body.channel,
       amount,
       reference: result.reference,
+      purpose: body.purpose,
     });
 
     if (result.mode === "mock") {
       const transitionResult = await applyPaymentTransition(db, {
         reference: result.reference,
         status: "paid",
-        eventLabel: "Mock deposit paid",
+        eventLabel: body.purpose === "balance" ? "Mock balance paid" : "Mock deposit paid",
         rawPayload: { event: "mock.charge.success", data: { reference: result.reference } },
       });
 

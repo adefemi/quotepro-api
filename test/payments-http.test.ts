@@ -45,6 +45,7 @@ type PaymentRow = {
   email: string;
   channel: string;
   amount: number;
+  purpose: "deposit" | "balance";
   status: string;
   paid_at: Date | null;
   raw_payload: unknown;
@@ -75,6 +76,7 @@ class PaymentRoutesFakeDb {
   providers = new Map<string, ProviderRow>();
   quoteEvents: QuoteEventRow[] = [];
   notifications: Array<{ id: string }> = [];
+  feedback: Array<{ quote_id: string; provider_id: string; type: string; message: string; rating: number | null }> = [];
   private nextId = 1;
 
   seedDepositQuote(input: Partial<QuoteRow> & Pick<QuoteRow, "public_slug" | "quote_number">) {
@@ -165,6 +167,24 @@ class PaymentRoutesFakeDb {
       };
     }
 
+    if (normalized.includes("from quote_client_feedback qcf")) {
+      return {
+        rows: this.feedback
+          .filter((row) => row.quote_id === params[0])
+          .map((row, index) => {
+            const quote = this.quotes.get(row.quote_id)!;
+            return {
+              id: `feedback-${index + 1}`,
+              quote_number: quote.quote_number,
+              type: row.type,
+              message: row.message,
+              rating: row.rating,
+              created_at: new Date(),
+            };
+          }),
+      };
+    }
+
     if (normalized.includes("from providers p") && normalized.includes("where p.id = $1")) {
       const provider = this.providers.get(params[0] as string);
       return {
@@ -187,6 +207,7 @@ class PaymentRoutesFakeDb {
         email: params[2] as string,
         channel: params[3] as string,
         amount: params[4] as number,
+        purpose: (params[5] as "deposit" | "balance") ?? "deposit",
         status: "initialized",
         paid_at: null,
         raw_payload: null,
@@ -213,6 +234,7 @@ class PaymentRoutesFakeDb {
             amount: payment.amount,
             paystack_reference: payment.paystack_reference,
             status: payment.status,
+            purpose: payment.purpose,
           },
         ],
       };
@@ -241,27 +263,59 @@ class PaymentRoutesFakeDb {
       };
     }
 
-    if (normalized.startsWith("update quotes set status = 'partial'")) {
+    if (normalized.startsWith("update quotes set status = $2")) {
       const quote = [...this.quotes.values()].find((q) => q.id === params[0]);
       if (quote) {
-        quote.status = "partial";
+        quote.status = params[1] as string;
       }
+      return { rows: [] };
+    }
+
+    if (normalized.startsWith("update quotes set status = case when status in")) {
+      const quote = [...this.quotes.values()].find((q) => q.id === params[0]);
+      if (quote && ["draft", "sent"].includes(quote.status)) {
+        quote.status = "viewed";
+      }
+      return { rows: [] };
+    }
+
+    if (normalized.startsWith("insert into quote_client_feedback")) {
+      this.feedback.push({
+        quote_id: params[0] as string,
+        provider_id: params[1] as string,
+        type: params[2] as string,
+        message: params[3] as string,
+        rating: params[4] as number | null,
+      });
       return { rows: [] };
     }
 
     if (normalized.startsWith("insert into quote_events")) {
       const quoteId = params[0] as string;
       const label = params[1] as string;
-      const kind = normalized.includes("'deposit_paid'")
-        ? "deposit_paid"
-        : normalized.includes("'payment_failed'")
-          ? "payment_failed"
-          : "unknown";
+      let kind = "unknown";
+      if (typeof params[1] === "string" && typeof params[2] === "string") {
+        kind = params[1] as string;
+      } else if (normalized.includes("'viewed'")) {
+        kind = "viewed";
+      } else if (normalized.includes("'accepted'")) {
+        kind = "accepted";
+      } else if (normalized.includes("'deposit_paid'")) {
+        kind = "deposit_paid";
+      } else if (normalized.includes("'balance_paid'")) {
+        kind = "balance_paid";
+      } else if (normalized.includes("'revision_requested'")) {
+        kind = "revision_requested";
+      } else if (normalized.includes("'review_received'")) {
+        kind = "review_received";
+      } else if (normalized.includes("'payment_failed'")) {
+        kind = "payment_failed";
+      }
       this.quoteEvents.push({
         id: `evt-${this.nextId++}`,
         quote_id: quoteId,
         kind,
-        label,
+        label: (params[2] as string | undefined) ?? label ?? "event",
         occurred_at: new Date(),
       });
       return { rows: [] };
@@ -326,6 +380,48 @@ describe("payments HTTP routes", () => {
       status: "paid",
     });
     expect(quote.status).toBe("partial");
+  });
+
+  it("initializes a mock balance payment and marks the quote paid", async () => {
+    const fake = new PaymentRoutesFakeDb();
+    fake.seedProvider();
+    const quote = fake.seedDepositQuote({
+      public_slug: "PUB-BALANCE-1",
+      quote_number: "Q-BAL-1",
+      status: "partial",
+      total_amount: 120_000,
+      deposit_amount: 50_000,
+    });
+
+    const app = await makeApp(fake as unknown as Database);
+    apps.add(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/payments/initialize",
+      payload: {
+        email: "buyer@example.com",
+        channel: "card",
+        publicSlug: "PUB-BALANCE-1",
+        purpose: "balance",
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { reference: string };
+    const stored = fake.payments.get(body.reference);
+    expect(stored).toMatchObject({
+      quote_id: quote.id,
+      amount: 70_000,
+      purpose: "balance",
+      status: "paid",
+    });
+    expect(quote.status).toBe("paid");
+    expect(fake.quoteEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ quote_id: quote.id, kind: "balance_paid" }),
+      ]),
+    );
   });
 
   it("rejects initialization when the quote does not collect a deposit", async () => {
@@ -398,6 +494,7 @@ describe("payments HTTP routes", () => {
       email: "buyer@example.com",
       channel: "card",
       amount: 50_000,
+      purpose: "deposit",
       status: "paid",
       paid_at: new Date(),
       raw_payload: null,
@@ -438,6 +535,7 @@ describe("payments HTTP routes", () => {
       email: "buyer@example.com",
       channel: "card",
       amount: 50_000,
+      purpose: "deposit",
       status: "initialized",
       paid_at: null,
       raw_payload: null,
@@ -474,6 +572,7 @@ describe("payments HTTP routes", () => {
       email: "buyer@example.com",
       channel: "card",
       amount: 50_000,
+      purpose: "deposit",
       status: "initialized",
       paid_at: null,
       raw_payload: null,
@@ -549,6 +648,7 @@ describe("payments HTTP routes", () => {
       email: "buyer2@example.com",
       channel: "card",
       amount: 50_000,
+      purpose: "deposit",
       status: "initialized",
       paid_at: null,
       raw_payload: null,
@@ -603,5 +703,67 @@ describe("payments HTTP routes", () => {
       payload: body,
     });
     expect(bad.statusCode).toBe(401);
+  });
+
+  it("records a public quote view once for noisy refreshes", async () => {
+    const fake = new PaymentRoutesFakeDb();
+    fake.seedProvider();
+    const quote = fake.seedDepositQuote({
+      public_slug: "VIEW-SLUG",
+      quote_number: "Q-VIEW",
+      status: "sent",
+    });
+
+    const app = await makeApp(fake as unknown as Database);
+    apps.add(app);
+
+    const first = await app.inject({ method: "POST", url: "/public/quotes/VIEW-SLUG/view" });
+    const second = await app.inject({ method: "POST", url: "/public/quotes/VIEW-SLUG/view" });
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(quote.status).toBe("viewed");
+    expect(fake.quoteEvents.filter((event) => event.kind === "viewed")).toHaveLength(1);
+    expect(fake.notifications).toHaveLength(1);
+  });
+
+  it("stores revision requests and reviews as events and notifications", async () => {
+    const fake = new PaymentRoutesFakeDb();
+    fake.seedProvider();
+    const quote = fake.seedDepositQuote({
+      public_slug: "FEEDBACK-SLUG",
+      quote_number: "Q-FEEDBACK",
+      status: "partial",
+    });
+
+    const app = await makeApp(fake as unknown as Database);
+    apps.add(app);
+
+    const revision = await app.inject({
+      method: "POST",
+      url: "/public/quotes/FEEDBACK-SLUG/revision-requests",
+      payload: { message: "Please add the extra sink repair." },
+    });
+    const review = await app.inject({
+      method: "POST",
+      url: "/public/quotes/FEEDBACK-SLUG/reviews",
+      payload: { rating: 5, message: "Great job and clean finish." },
+    });
+
+    expect(revision.statusCode).toBe(200);
+    expect(review.statusCode).toBe(200);
+    expect(fake.feedback).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ quote_id: quote.id, type: "revision_request" }),
+        expect.objectContaining({ quote_id: quote.id, type: "review", rating: 5 }),
+      ]),
+    );
+    expect(fake.quoteEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "revision_requested" }),
+        expect.objectContaining({ kind: "review_received" }),
+      ]),
+    );
+    expect(fake.notifications).toHaveLength(2);
   });
 });

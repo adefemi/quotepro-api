@@ -14,9 +14,11 @@ import type {
   NotificationPushKind,
   NotificationPushPayload,
   PaymentRecordDto,
+  PaymentPurpose,
   PaymentStatus,
   PayoutAccountDto,
   ProviderNotificationDto,
+  QuoteClientFeedbackDto,
   ProviderProfileDto,
   QuoteBundleDto,
   QuoteDto,
@@ -166,6 +168,17 @@ function mapEvent(row: QueryResultRow): QuoteEventDto {
   };
 }
 
+function mapQuoteFeedback(row: QueryResultRow): QuoteClientFeedbackDto {
+  return {
+    id: row.id as string,
+    quoteId: row.quote_number as string,
+    type: row.type as "revision_request" | "review",
+    message: row.message as string,
+    rating: row.rating ?? undefined,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+  };
+}
+
 async function getQuoteItems(db: DatabaseClient, quoteUuid: string): Promise<QuoteLineItemDto[]> {
   const result = await db.query(
     `
@@ -199,6 +212,21 @@ async function getQuoteEvents(db: DatabaseClient, quoteUuid: string): Promise<Qu
   );
 
   return result.rows.map(mapEvent);
+}
+
+async function getQuoteFeedback(db: DatabaseClient, quoteUuid: string): Promise<QuoteClientFeedbackDto[]> {
+  const result = await db.query(
+    `
+      select qcf.id::text, q.quote_number, qcf.type, qcf.message, qcf.rating, qcf.created_at
+      from quote_client_feedback qcf
+      join quotes q on q.id = qcf.quote_id
+      where qcf.quote_id = $1
+      order by qcf.created_at asc
+    `,
+    [quoteUuid],
+  );
+
+  return result.rows.map(mapQuoteFeedback);
 }
 
 async function getQuoteCompany(db: DatabaseClient, companyId?: string | null): Promise<CompanyProfileDto | undefined> {
@@ -327,6 +355,19 @@ export async function markProviderNotificationRead(db: Database, providerId: str
       update provider_notifications
       set read_at = coalesce(read_at, now())
       where id = $1 and provider_id = $2
+      returning id::text
+    `,
+    [notificationId, providerId],
+  );
+
+  return Boolean(result.rows[0]);
+}
+
+export async function deleteProviderNotification(db: Database, providerId: string, notificationId: string) {
+  const result = await db.query(
+    `
+      delete from provider_notifications
+      where id = $1 and provider_id = $2 and read_at is not null
       returning id::text
     `,
     [notificationId, providerId],
@@ -1052,6 +1093,7 @@ export async function updateQuote(
     customerPhone?: string;
     customerLocation?: string;
     prompt?: string;
+    aiEditMode?: "replace" | "applyAdditionalInfo";
     jobTitle?: string;
     description?: string;
     items?: Array<{
@@ -1071,6 +1113,7 @@ export async function updateQuote(
 
     const collectDeposit = input.collectDeposit ?? existing.collect_deposit;
     const company = await getQuoteCompany(client, existing.company_id);
+    const existingItems = await getQuoteItems(client, existing.id);
     const regenerated = input.prompt
       ? await generateQuoteFromPrompt({
           prompt: input.prompt,
@@ -1079,7 +1122,24 @@ export async function updateQuote(
           serviceLine: company?.serviceLine,
         })
       : null;
-    const items = input.items ?? regenerated?.items;
+    const items =
+      input.items ??
+      (input.aiEditMode === "applyAdditionalInfo" && regenerated
+        ? [
+            ...existingItems.map(({ title, quantityLabel, unitAmount, totalAmount }) => ({
+              title,
+              quantityLabel,
+              unitAmount,
+              totalAmount,
+            })),
+            ...regenerated.items.filter(
+              (item) =>
+                !existingItems.some(
+                  (existingItem) => existingItem.title.trim().toLowerCase() === item.title.trim().toLowerCase(),
+                ),
+            ),
+          ]
+        : regenerated?.items);
     const subtotalAmount = items?.reduce((sum, item) => sum + item.totalAmount, 0) ?? existing.subtotal_amount;
     const vatAmount = items ? Math.round(subtotalAmount * 0.075) : existing.vat_amount;
     const totalAmount = subtotalAmount + vatAmount;
@@ -1412,6 +1472,7 @@ export async function getPublicQuoteBundle(db: DatabaseClient, slugOrId: string)
     quote: mapQuote(row, await getQuoteItems(db, row.id), await getQuoteCompany(db, row.company_id)),
     provider: await getProviderById(db, row.provider_id),
     timeline: await getQuoteEvents(db, row.id),
+    feedback: await getQuoteFeedback(db, row.id),
   };
 }
 
@@ -1460,6 +1521,7 @@ export async function recordPublicView(db: Database, slugOrId: string): Promise<
       return null;
     }
 
+    const shouldRecordView = ["draft", "sent"].includes(row.status as string);
     await client.query(
       `
         update quotes
@@ -1468,38 +1530,41 @@ export async function recordPublicView(db: Database, slugOrId: string): Promise<
       `,
       [row.id],
     );
-    await client.query(
-      "insert into quote_events (quote_id, kind, label) values ($1, 'viewed', 'Quote viewed')",
-      [row.id],
-    );
 
     const providerId = row.provider_id as string;
     const quoteId = row.id as string;
     const customerLabel = (row.customer_name as string) || "A customer";
     const title = "Quote viewed";
     const body = `${customerLabel} viewed your quote`;
-    const notificationId = await insertQuoteProviderNotification(client, {
-      providerId,
-      quoteId,
-      kind: "viewed",
-      title,
-      body,
-      metadata: { quoteNumber: row.quote_number },
-    });
+    let pushTarget: NotificationPushPayload | undefined;
+
+    if (shouldRecordView) {
+      await client.query(
+        "insert into quote_events (quote_id, kind, label) values ($1, 'viewed', 'Quote viewed')",
+        [row.id],
+      );
+      const notificationId = await insertQuoteProviderNotification(client, {
+        providerId,
+        quoteId,
+        kind: "viewed",
+        title,
+        body,
+        metadata: { quoteNumber: row.quote_number },
+      });
+      pushTarget = {
+        providerId,
+        notificationId,
+        quoteId,
+        kind: "viewed",
+        title,
+        body,
+      };
+    }
 
     const bundle = await getPublicQuoteBundle(client, row.public_slug);
     if (!bundle) {
       throw new Error("Quote bundle missing after public view.");
     }
-
-    const pushTarget: NotificationPushPayload = {
-      providerId,
-      notificationId,
-      quoteId,
-      kind: "viewed",
-      title,
-      body,
-    };
 
     return { bundle, pushTarget };
   });
@@ -1554,9 +1619,87 @@ export async function recordPublicAccept(db: Database, slugOrId: string): Promis
   });
 }
 
+export async function recordQuoteClientFeedback(
+  db: Database,
+  slugOrId: string,
+  input: { type: "revision_request" | "review"; message: string; rating?: number },
+): Promise<QuotePublicActionResult | null> {
+  return withTransaction(db, async (client) => {
+    const row = await findQuoteRow(client, slugOrId);
+
+    if (!row || row.status === "archived") {
+      return null;
+    }
+
+    const providerId = row.provider_id as string;
+    const quoteId = row.id as string;
+    await client.query(
+      `
+        insert into quote_client_feedback (quote_id, provider_id, type, message, rating)
+        values ($1, $2, $3, $4, $5)
+      `,
+      [quoteId, providerId, input.type, input.message, input.rating ?? null],
+    );
+
+    const kind = input.type === "review" ? "review_received" : "revision_requested";
+    const eventLabel =
+      input.type === "review"
+        ? `Customer review (${input.rating ?? 0}/5): ${input.message}`
+        : `Revision requested: ${input.message}`;
+    await client.query("insert into quote_events (quote_id, kind, label) values ($1, $2, $3)", [
+      quoteId,
+      kind,
+      eventLabel,
+    ]);
+
+    const customerLabel = (row.customer_name as string) || "A customer";
+    const title = input.type === "review" ? "New quote review" : "Quote revision requested";
+    const body =
+      input.type === "review"
+        ? `${customerLabel} left a ${input.rating ?? 0}-star review`
+        : `${customerLabel} requested changes to your quote`;
+    const notificationId = await insertQuoteProviderNotification(client, {
+      providerId,
+      quoteId,
+      kind,
+      title,
+      body,
+      metadata: {
+        quoteNumber: row.quote_number,
+        message: input.message,
+        rating: input.rating ?? null,
+      },
+    });
+
+    const bundle = await getPublicQuoteBundle(client, row.public_slug);
+    if (!bundle) {
+      throw new Error("Quote bundle missing after client feedback.");
+    }
+
+    return {
+      bundle,
+      pushTarget: {
+        providerId,
+        notificationId,
+        quoteId,
+        kind,
+        title,
+        body,
+      },
+    };
+  });
+}
+
 export async function createInitializedPayment(
   db: Database,
-  input: { publicSlug: string; email: string; channel: string; amount: number; reference: string },
+  input: {
+    publicSlug: string;
+    email: string;
+    channel: string;
+    amount: number;
+    reference: string;
+    purpose: PaymentPurpose;
+  },
 ) {
   const row = await findQuoteRow(db, input.publicSlug);
 
@@ -1566,12 +1709,16 @@ export async function createInitializedPayment(
 
   await db.query(
     `
-      insert into payments (quote_id, paystack_reference, email, channel, amount, status)
-      values ($1, $2, $3, $4, $5, 'initialized')
+      insert into payments (quote_id, paystack_reference, email, channel, amount, purpose, status)
+      values ($1, $2, $3, $4, $5, $6, 'initialized')
       on conflict (paystack_reference) do update
-      set email = excluded.email, channel = excluded.channel, amount = excluded.amount, status = 'initialized'
+      set email = excluded.email,
+          channel = excluded.channel,
+          amount = excluded.amount,
+          purpose = excluded.purpose,
+          status = 'initialized'
     `,
-    [row.id, input.reference, input.email, input.channel, input.amount],
+    [row.id, input.reference, input.email, input.channel, input.amount, input.purpose],
   );
 
   return row;
@@ -1583,7 +1730,7 @@ export async function getPublicPaymentByReference(
 ): Promise<PaymentRecordDto | null> {
   const result = await db.query(
     `
-      select p.id::text, q.quote_number, p.amount, p.paystack_reference, p.status
+      select p.id::text, q.quote_number, p.amount, p.paystack_reference, p.status, p.purpose
       from payments p
       join quotes q on q.id = p.quote_id
       where p.paystack_reference = $1
@@ -1605,6 +1752,7 @@ export async function getPublicPaymentByReference(
     amount: row.amount,
     reference: row.paystack_reference,
     status: row.status,
+    purpose: row.purpose,
   };
 }
 
@@ -1646,31 +1794,44 @@ export async function applyPaymentTransition(
     const quoteId = paymentRow.quote_id as string;
 
     if (input.status === "paid") {
+      const purpose = (paymentRow.purpose ?? "deposit") as PaymentPurpose;
+      const quoteStatus = purpose === "balance" ? "paid" : "partial";
+      const eventKind = purpose === "balance" ? "balance_paid" : "deposit_paid";
+      const notificationKind = purpose === "balance" ? "balance_paid" : "deposit_paid";
+      const eventLabel = purpose === "balance" ? input.eventLabel.replace(/^Deposit/i, "Balance") : input.eventLabel;
       await client.query(
-        "update quotes set status = 'partial', paid_at = coalesce(paid_at, now()) where id = $1",
-        [paymentRow.quote_id],
+        "update quotes set status = $2, paid_at = coalesce(paid_at, now()) where id = $1",
+        [paymentRow.quote_id, quoteStatus],
       );
-      await client.query(
-        "insert into quote_events (quote_id, kind, label) values ($1, 'deposit_paid', $2)",
-        [paymentRow.quote_id, input.eventLabel],
-      );
+      await client.query("insert into quote_events (quote_id, kind, label) values ($1, $2, $3)", [
+        paymentRow.quote_id,
+        eventKind,
+        eventLabel,
+      ]);
       if (providerId && quoteRow) {
         const customerLabel = (quoteRow.customer_name as string) || "A customer";
-        const title = "Deposit received";
-        const body = `Deposit paid for ${customerLabel}'s quote`;
+        const title = purpose === "balance" ? "Balance received" : "Deposit received";
+        const body =
+          purpose === "balance"
+            ? `Balance paid for ${customerLabel}'s quote`
+            : `Deposit paid for ${customerLabel}'s quote`;
         const notificationId = await insertQuoteProviderNotification(client, {
           providerId,
           quoteId,
-          kind: "deposit_paid",
+          kind: notificationKind,
           title,
           body,
-          metadata: { quoteNumber: quoteRow.quote_number as string, paystackReference: input.reference },
+          metadata: {
+            quoteNumber: quoteRow.quote_number as string,
+            paystackReference: input.reference,
+            purpose,
+          },
         });
         pushTarget = {
           providerId,
           notificationId,
           quoteId,
-          kind: "deposit_paid",
+          kind: notificationKind,
           title,
           body,
         };
