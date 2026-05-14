@@ -45,6 +45,8 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:4000}
     ports:
       - "${API_PUBLIC_PORT:-4000}:4000"
+    volumes:
+      - ./firebase.json:/app/firebase.json:ro
     depends_on:
       postgres:
         condition: service_healthy

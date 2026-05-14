@@ -43,6 +43,8 @@ export async function sendMulticastNotification(tokens: string[], target: Notifi
       quoteId: target.quoteId,
       kind: target.kind,
       notificationId: target.notificationId,
+      title: target.title,
+      body: target.body,
     },
     android: {
       priority: "high",
