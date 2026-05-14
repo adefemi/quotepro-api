@@ -921,6 +921,7 @@ describe("company and payout profiles", () => {
       channel: "card",
       amount: createdQuote.depositAmount,
       reference: "paystack-ref-1",
+      purpose: "deposit",
     });
     await applyPaymentTransition(db, {
       reference: "paystack-ref-1",
