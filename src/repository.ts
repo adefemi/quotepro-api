@@ -1346,79 +1346,10 @@ export async function getOrCreateQuoteEditDraft(db: Database, providerId: string
       return null;
     }
 
-    if (source.status === "draft") {
-      return mapQuote(source, await getQuoteItems(client, source.id), await getQuoteCompany(client, source.company_id));
-    }
-
-    const existingDraft = await client.query(
-      `
-        select *
-        from quotes
-        where provider_id = $1
-          and source_quote_id = $2
-          and status = 'draft'
-        order by created_at desc
-        limit 1
-      `,
-      [providerId, source.id],
-    );
-
-    if (existingDraft.rows[0]) {
-      const row = existingDraft.rows[0];
-      return mapQuote(row, await getQuoteItems(client, row.id), await getQuoteCompany(client, row.company_id));
-    }
-
-    const inserted = await client.query(
-      `
-        insert into quotes (
-          quote_number, public_slug, source_quote_id, provider_id, customer_id, customer_name,
-          customer_phone, customer_location, job_title, description, prompt, subtotal_amount,
-          vat_amount, total_amount, deposit_amount, collect_deposit, valid_until, company_id
-        )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-        returning *
-      `,
-      [
-        quoteNumber(),
-        publicSlug(),
-        source.id,
-        providerId,
-        source.customer_id,
-        source.customer_name,
-        source.customer_phone,
-        source.customer_location,
-        source.job_title,
-        source.description,
-        source.prompt,
-        source.subtotal_amount,
-        source.vat_amount,
-        source.total_amount,
-        source.deposit_amount,
-        source.collect_deposit,
-        new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-        source.company_id,
-      ],
-    );
-
-    for (const [index, item] of (await getQuoteItems(client, source.id)).entries()) {
-      await client.query(
-        `
-          insert into quote_items (quote_id, title, quantity_label, unit_amount, total_amount, sort_order)
-          values ($1, $2, $3, $4, $5, $6)
-        `,
-        [inserted.rows[0].id, item.title, item.quantityLabel, item.unitAmount, item.totalAmount, index],
-      );
-    }
-
-    await client.query(
-      "insert into quote_events (quote_id, kind, label) values ($1, 'drafted', 'Quote draft created for editing')",
-      [inserted.rows[0].id],
-    );
-
     return mapQuote(
-      inserted.rows[0],
-      await getQuoteItems(client, inserted.rows[0].id),
-      await getQuoteCompany(client, inserted.rows[0].company_id),
+      source,
+      await getQuoteItems(client, source.id),
+      await getQuoteCompany(client, source.company_id),
     );
   });
 }

@@ -862,7 +862,7 @@ describe("company and payout profiles", () => {
     expect(await listQuotes(db, "provider-1")).toHaveLength(0);
   });
 
-  it("reuses one edit draft for an existing quote", async () => {
+  it("reopens the existing quote for editing", async () => {
     const db = new FakeDb() as unknown as Database;
     const quote = await createQuote(db, "provider-1", {
       customerName: "Ada",
@@ -878,12 +878,13 @@ describe("company and payout profiles", () => {
 
     expect(sent?.quote.status).toBe("sent");
 
-    const firstDraft = await getOrCreateQuoteEditDraft(db, "provider-1", createdQuote.id);
-    const secondDraft = await getOrCreateQuoteEditDraft(db, "provider-1", createdQuote.id);
+    const firstEdit = await getOrCreateQuoteEditDraft(db, "provider-1", createdQuote.id);
+    const secondEdit = await getOrCreateQuoteEditDraft(db, "provider-1", createdQuote.id);
 
-    expect(firstDraft?.status).toBe("draft");
-    expect(secondDraft?.id).toBe(firstDraft?.id);
-    expect(await listQuotes(db, "provider-1")).toHaveLength(2);
+    expect(firstEdit?.id).toBe(createdQuote.id);
+    expect(firstEdit?.status).toBe("sent");
+    expect(secondEdit?.id).toBe(firstEdit?.id);
+    expect(await listQuotes(db, "provider-1")).toHaveLength(1);
   });
 
   it("smoke tests quote send, public activity, payment, dashboard, and earnings", async () => {
